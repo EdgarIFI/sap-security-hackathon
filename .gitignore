@@ -206,7 +206,30 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-# Apartir de estas lineas estan los contenidos especificos para nuestro proyecto
+# ==============================================================================
+# Específico para este proyecto — SAP AI Security Hackathon
+# ==============================================================================
+
+# --- Credenciales y configuración local ---
+# El archivo más crítico. Nunca debe salir de tu máquina.
 .env
+
+# --- Datos ---
+# Los datos crudos no van a Git por dos razones:
+# 1. Pueden pesar muchísimo (54,832 registros por ventana)
+# 2. Son regenerables — cualquiera puede correr ingest.py y obtenerlos
 data/raw/
 data/processed/
+
+# Los archivos de esquema de muestra tampoco — son locales
+data/SCHEMA.md
+
+# --- Scripts de prueba temporal ---
+# Estos dos scripts son de diagnóstico personal, no son parte del producto
+prueba_health.py
+prueba_info.py
+
+# --- Entorno virtual ---
+# Cada quien crea el suyo localmente con pip install -r requirements.txt
+# Puede pesar cientos de MB — nunca va a Git
+.venv/
