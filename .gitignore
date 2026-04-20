@@ -222,7 +222,7 @@ data/raw/
 data/processed/
 
 # Los archivos de esquema de muestra tampoco — son locales
-data/SCHEMA.md
+# data/SCHEMA.md
 
 # --- Scripts de prueba temporal ---
 # Estos dos scripts son de diagnóstico personal, no son parte del producto
