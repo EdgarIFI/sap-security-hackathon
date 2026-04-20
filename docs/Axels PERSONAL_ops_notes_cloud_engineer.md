@@ -21,18 +21,18 @@
 
 ## BLOQUE 0 — Antes de tocar código (primeros 30 minutos)
 
-Antes de escribir una sola línea, resuelve estas preguntas. Si no tienes respuesta a alguna, es tu primer bloqueante y hay que escalarlo al PM inmediatamente.
+Antes de escribir una sola línea, debo resolver estas preguntas. Si no hay respuesta a alguna, es mi primer bloqueante y hay que escalarlo al PM inmediatamente.
 
 ```
-¿Tengo la URL base de la API de SAP?          [ ] SÍ  [ ] NO → escalarlo
-¿Tengo la API Key o credencial de acceso?     [ ] SÍ  [ ] NO → escalarlo
-¿Tengo un ejemplo del payload de respuesta?   [ ] SÍ  [ ] NO → pedirlo
-¿Tengo la URL del webhook de alerting?        [ ] SÍ  [ ] NO → puede esperar
-¿Tengo acceso al repositorio del equipo?      [ ] SÍ  [ ] NO → crearlo yo
-¿Tenemos HANA connection string?              [ ] SÍ  [ ] NO → puede esperar
+¿Tengo la URL base de la API de SAP?          [x] SÍ  [ ] NO → escalarlo
+¿Tengo la API Key o credencial de acceso?     [x] SÍ  [ ] NO → escalarlo
+¿Tengo un ejemplo del payload de respuesta?   [x] SÍ  [ ] NO → pedirlo
+¿Tengo la URL del webhook de alerting?        [ ] SÍ  [x] NO → puede esperar
+¿Tengo acceso al repositorio del equipo?      [x] SÍ  [ ] NO → crearlo yo
+¿Tenemos HANA connection string?              [ ] SÍ  [x] NO → puede esperar
 ```
 
-**Regla crítica:** No guardes ninguna credencial en archivos de código. Todo va en `.env`.
+**Regla crítica:** No guardar ninguna credencial en archivos de código. Todo va en `.env`.
 
 ---
 
@@ -79,9 +79,9 @@ HANA_PASSWORD=
 ### 1.4 `.env` — esto NUNCA va en Git
 
 ```
-API_BASE_URL=https://[rellenar-cuando-tengas]
-API_KEY=[rellenar-cuando-tengas]
-WEBHOOK_URL=https://[rellenar-cuando-tengas]
+API_BASE_URL=https://[rellenar-cuando-tenga]
+API_KEY=[rellenar-cuando-tenga]
+WEBHOOK_URL=https://[rellenar-cuando-tenga]
 ```
 
 ### 1.5 Entorno virtual y dependencias
