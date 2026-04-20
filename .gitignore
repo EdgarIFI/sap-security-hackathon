@@ -233,3 +233,6 @@ prueba_info.py
 # Cada quien crea el suyo localmente con pip install -r requirements.txt
 # Puede pesar cientos de MB — nunca va a Git
 .venv/
+
+# Documento local del CIE
+tests/CIE.md
