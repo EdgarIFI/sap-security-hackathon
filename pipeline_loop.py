@@ -40,12 +40,16 @@ import os
 from datetime import datetime, timezone, timedelta
 
 # Agregamos app/ al path para poder importar desde ahí
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app"))
+# Usamos insert(0, ...) en lugar de append para que app/ tenga prioridad
+# sobre cualquier otro módulo con el mismo nombre en el sistema
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_DIR  = os.path.join(BASE_DIR, "app")
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
 
 import requests
 from config import validate_config
 from ingest import fetch_current_window, save_data
-
 
 # =============================================================================
 # ZONA HORARIA DE MONTERREY

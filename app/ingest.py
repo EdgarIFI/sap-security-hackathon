@@ -44,11 +44,15 @@ import time         # para hacer pausas entre llamadas y no saturar la API
 import os           # para crear carpetas si no existen
 import sys          # para poder salir del programa con código de error
 
-# Agregamos el directorio raíz al path de Python para que pueda encontrar config.py
-# Esto es necesario porque ingest.py está dentro de app/ pero config.py también
-# está en app/ — Python necesita saber dónde buscar módulos al importar
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
+# Agregamos el directorio de app/ al path de Python para que pueda encontrar config.py
+# Usamos insert(0, ...) en lugar de append para dar prioridad a nuestros módulos
+# sobre cualquier otro módulo con el mismo nombre que pudiera existir en el sistema
+# abspath(__file__) → ruta absoluta de ingest.py
+# dirname(...)      → carpeta que contiene ingest.py, que es app/
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+    
 from config import API_BASE_URL, get_headers, validate_config
 
 
