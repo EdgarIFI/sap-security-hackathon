@@ -99,7 +99,8 @@ def get_connection():
             user=HANA_USER,
             password=HANA_PASSWORD,
             encrypt=True,            # requerido para HANA Cloud
-            sslValidateCertificate=True
+            sslValidateCertificate=False,
+            sslHostNameInCertificate="*.hanacloud.ondemand.com"
         )
         logger.info(f"✓ Conexión HANA establecida ({HANA_HOST}:{HANA_PORT})")
         return conn
