@@ -7,52 +7,64 @@
 # Todos los demás scripts importan desde aquí — nunca leen .env directamente.
 #
 # Flujo:
-#   .env (en tu disco, nunca en Git)
+#   .env (en la raíz del proyecto, nunca en Git)
 #     └─► load_dotenv() carga esos valores en memoria
 #           └─► os.getenv() los lee y los asigna a variables Python
 #                 └─► el resto del proyecto importa esas variables desde aquí
+#
+# PROBLEMA QUE RESUELVE ESTA VERSIÓN:
+#   load_dotenv() sin argumentos busca .env en el directorio de trabajo actual
+#   (el directorio desde donde corres el script). Si corres pipeline_loop.py
+#   desde la raíz, el directorio actual ES la raíz, donde vive .env — bien.
+#   Pero si por alguna razón el directorio cambia, load_dotenv() no encuentra
+#   el .env. La solución es especificar la ruta absoluta del .env explícitamente,
+#   calculada en relación a la ubicación de este archivo (config.py en app/).
 # =============================================================================
 
-import os               # módulo estándar de Python para leer variables de entorno
-from dotenv import load_dotenv  # librería externa: lee el archivo .env y carga su contenido
+import os
+from dotenv import load_dotenv
 
 
 # -----------------------------------------------------------------------------
-# Cargar el archivo .env
+# Cargar el archivo .env con ruta absoluta
 # -----------------------------------------------------------------------------
-# load_dotenv() busca un archivo llamado ".env" en la carpeta actual
-# y pone sus contenidos en el entorno del proceso (en memoria, no en disco).
-# Si el archivo no existe, no falla — simplemente no carga nada.
-# Debe llamarse ANTES de cualquier os.getenv(), porque si no, no hay nada que leer.
+# __file__       → ruta absoluta de config.py         → .../app/config.py
+# dirname(...)   → carpeta que contiene config.py      → .../app/
+# dirname(...)   → carpeta padre (raíz del proyecto)   → .../sap-security-hackathon/
+# join(...,'.env')→ ruta completa del .env             → .../sap-security-hackathon/.env
+#
+# Así, sin importar desde dónde se ejecute el script que importa config.py,
+# siempre encontramos el .env en la raíz del proyecto.
 
-load_dotenv()
+_RAIZ_PROYECTO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_RUTA_ENV      = os.path.join(_RAIZ_PROYECTO, ".env")
+
+# dotenv_path especifica la ruta exacta del .env a cargar
+# override=False significa: si la variable ya existe en el entorno del sistema,
+# no la sobreescribas (respeta variables de entorno del sistema operativo)
+load_dotenv(dotenv_path=_RUTA_ENV, override=False)
 
 
 # -----------------------------------------------------------------------------
 # Variables de configuración
 # -----------------------------------------------------------------------------
 # os.getenv("NOMBRE") lee la variable NOMBRE del entorno.
-# Si no existe (porque no está en .env o .env no existe), devuelve None.
-# None es el valor que usaremos para detectar configuración faltante.
+# Si no existe devuelve None — detectado por validate_config().
 
-# URL base de la API del hackathon.
-# Ejemplo de cómo se ve en .env:
-#   API_BASE_URL=https://soc-api.hackathon.example.com
+# URL base de la API del hackathon (sin slash al final)
+# Ejemplo en .env:  API_BASE_URL=https://sap-api-b4.674318.xyz
 API_BASE_URL = os.getenv("API_BASE_URL")
 
-# Token de autenticación del equipo (Bearer token).
+# Token Bearer de autenticación del equipo
 # Se usa en el header: Authorization: Bearer <este valor>
-# Ejemplo en .env:
-#   BEARER_TOKEN=abc123xyz...
+# Ejemplo en .env:  BEARER_TOKEN=teamy-2026-...
 BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 
-# URL del webhook al que mandamos alertas cuando detectamos anomalías.
-# Aún no disponible — llegará antes del 27 de abril.
-# Ejemplo en .env:
-#   WEBHOOK_URL=https://webhook.site/...
+# URL del webhook para envío de alertas (disponible desde Abr 27)
+# Ejemplo en .env:  WEBHOOK_URL=https://webhook.site/...
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# Datos de conexión a SAP HANA (pendientes — los provee el Data Architect).
+# Credenciales de SAP HANA (las provee el Data Architect una vez configurada la instancia)
 HANA_HOST     = os.getenv("HANA_HOST")
 HANA_PORT     = os.getenv("HANA_PORT")
 HANA_USER     = os.getenv("HANA_USER")
@@ -62,22 +74,20 @@ HANA_PASSWORD = os.getenv("HANA_PASSWORD")
 # -----------------------------------------------------------------------------
 # validate_config()
 # -----------------------------------------------------------------------------
-# Función de validación temprana.
+# Verifica que las variables críticas estén presentes ANTES de intentar
+# cualquier llamada HTTP. Falla rápido con mensaje claro en lugar de
+# producir errores crípticos muchas líneas después.
 #
-# Por qué existe: si falta una variable crítica (por ejemplo, olvidaste poner
-# el BEARER_TOKEN en .env), es mejor saberlo INMEDIATAMENTE al arrancar,
-# con un mensaje claro, que descubrirlo 10 líneas después con un error críptico
-# como "NoneType has no attribute 'encode'".
-#
-# Cuándo llamarla: al inicio de cualquier script que necesite conectarse a la API.
-# Si la validación falla, el programa para antes de intentar nada.
+# Cuándo llamarla: al inicio de cualquier script que se conecte a la API.
 
 def validate_config():
     """
     Verifica que las variables de entorno críticas estén presentes.
-    Lanza un error explícito si falta alguna, en lugar de fallar silenciosamente.
+
+    Raises:
+        EnvironmentError: si falta alguna variable obligatoria,
+                          con lista clara de cuáles faltan.
     """
-    # Diccionario de variables que consideramos obligatorias para operar
     required = {
         "API_BASE_URL": API_BASE_URL,
         "BEARER_TOKEN": BEARER_TOKEN,
@@ -87,10 +97,10 @@ def validate_config():
     missing = [nombre for nombre, valor in required.items() if not valor]
 
     if missing:
-        # Si falta algo, levantamos un error con lista clara de qué falta
         raise EnvironmentError(
             f"Faltan variables de entorno obligatorias: {missing}\n"
-            f"Verifica que tu archivo .env existe y contiene estas variables."
+            f"Archivo .env buscado en: {_RUTA_ENV}\n"
+            f"Verifica que el archivo existe y contiene estas variables."
         )
 
     # Si llegamos aquí, todo está presente
@@ -100,31 +110,26 @@ def validate_config():
 # -----------------------------------------------------------------------------
 # get_headers()
 # -----------------------------------------------------------------------------
-# Función de conveniencia que construye el header de autenticación.
+# Construye el header de autenticación Bearer listo para usar en requests.
 #
-# Por qué existe como función y no como variable:
-# Si lo declaráramos como variable al importar este módulo, el valor quedaría
-# fijo en ese momento. Como función, se construye cada vez que se llama,
-# tomando el valor actual de BEARER_TOKEN. Más flexible y fácil de probar.
+# Por qué es función y no variable global:
+#   Si fuera variable global, se evaluaría una sola vez al importar el módulo.
+#   Como función, se construye cada vez que se llama, garantizando que siempre
+#   usa el valor actual de BEARER_TOKEN (útil si el token se rota en caliente).
 #
-# Cómo se usa en otros scripts:
+# Uso en otros scripts:
 #   from config import get_headers
-#   response = requests.get(url, headers=get_headers())
+#   response = requests.get(url, headers=get_headers(), timeout=15)
 
 def get_headers() -> dict:
     """
-    Devuelve el diccionario de headers HTTP necesario para autenticarse
-    con la API del hackathon.
-
-    La API usa Bearer token en el header Authorization.
-    Formato oficial: Authorization: Bearer <token>
+    Devuelve el header HTTP de autenticación Bearer.
 
     Returns:
-        dict con el header de autenticación listo para pasar a requests.get()
+        dict: {"Authorization": "Bearer <token>"}
     """
     return {
         "Authorization": f"Bearer {BEARER_TOKEN}"
-        # f"Bearer {BEARER_TOKEN}" construye el string:
-        # si BEARER_TOKEN = "abc123", el resultado es "Bearer abc123"
-        # La f antes de las comillas indica que es un f-string (string con variables)
+        # Si BEARER_TOKEN = "abc123", resultado: "Authorization: Bearer abc123"
+        # La f antes de las comillas indica f-string (string con variables embebidas)
     }
