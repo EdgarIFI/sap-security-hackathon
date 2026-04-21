@@ -1,0 +1,80 @@
+# =============================================================================
+# manifest.yml
+# =============================================================================
+# Propósito: decirle a Cloud Foundry cómo desplegar y correr nuestra aplicación.
+#
+# Este archivo es el equivalente a las "instrucciones de instalación" para CF.
+# Cuando ejecutas "cf push", CF lee este archivo y configura todo automáticamente.
+#
+# Cómo usarlo:
+#   cf push
+#   (CF busca manifest.yml en la carpeta actual automáticamente)
+#
+# Variables de entorno:
+#   Las credenciales NO van hardcodeadas aquí.
+#   Se configuran en CF con: cf set-env sap-ai-soc NOMBRE_VARIABLE valor
+#   CF las inyecta al proceso automáticamente al arrancar.
+# =============================================================================
+
+applications:
+  - name: sap-ai-soc
+    # Nombre de la aplicación en Cloud Foundry
+    # Debe ser único en tu organización
+
+    memory: 512M
+    # RAM asignada al proceso
+    # 512MB es suficiente para el pipeline de ingesta con pandas
+    # Si el modelo ML es pesado, aumentar a 1024M
+
+    disk_quota: 1G
+    # Espacio en disco para los CSV locales temporales
+    # Los datos permanentes van a HANA, pero necesitamos espacio para data/raw/
+
+    instances: 1
+    # Número de instancias del proceso
+    # 1 es suficiente — múltiples instancias harían ingesta duplicada
+
+    buildpacks:
+      - python_buildpack
+    # Le dice a CF que esto es una aplicación Python
+    # CF instala automáticamente todo lo que está en requirements.txt
+
+    command: python pipeline_loop.py
+    # El comando que CF ejecuta para arrancar la aplicación
+    # Es exactamente el mismo comando que usas localmente
+
+    health-check-type: process
+    # Cómo CF verifica que la app está viva
+    # "process" = la app está viva si el proceso Python sigue corriendo
+    # (no usamos "http" porque no tenemos un servidor web, solo un loop)
+
+    env:
+      # Variables de entorno inyectadas por CF al proceso
+      # Los valores reales se configuran con: cf set-env sap-ai-soc NOMBRE valor
+      # Aquí solo declaramos los nombres para documentar qué se necesita
+
+      API_BASE_URL: ""
+      # URL base de la API del hackathon
+      # Configurar con: cf set-env sap-ai-soc API_BASE_URL https://sap-api-b4.674318.xyz
+
+      BEARER_TOKEN: ""
+      # Token de autenticación del equipo
+      # Configurar con: cf set-env sap-ai-soc BEARER_TOKEN tu-token-aqui
+
+      WEBHOOK_URL: ""
+      # URL del webhook de alerting (disponible Abr 27)
+      # Configurar con: cf set-env sap-ai-soc WEBHOOK_URL https://...
+
+      HANA_HOST: ""
+      # Host de SAP HANA Cloud
+      # Configurar con: cf set-env sap-ai-soc HANA_HOST tu-host.hanacloud.ondemand.com
+
+      HANA_PORT: "443"
+      # Puerto de HANA Cloud (443 para conexión cifrada)
+
+      HANA_USER: "DBADMIN"
+      # Usuario de HANA
+
+      HANA_PASSWORD: ""
+      # Contraseña de HANA
+      # Configurar con: cf set-env sap-ai-soc HANA_PASSWORD tu-password

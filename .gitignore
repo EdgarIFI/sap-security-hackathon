@@ -236,3 +236,5 @@ prueba_info.py
 
 # Documento local del CIE
 tests/CIE.md
+
+tests/soc-key.json
