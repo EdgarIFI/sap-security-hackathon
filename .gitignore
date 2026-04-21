@@ -238,3 +238,6 @@ prueba_info.py
 tests/CIE.md
 
 tests/soc-key.json
+
+# Carpeta VS Code
+.vscode/
