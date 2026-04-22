@@ -127,8 +127,7 @@ def get_connection():
             user=HANA_USER,
             password=HANA_PASSWORD,
             encrypt=True,
-            sslValidateCertificate=False,
-            sslHostNameInCertificate="*.hanacloud.ondemand.com"
+            sslValidateCertificate=False
         )
         logger.info(f"✓ Conexión HANA establecida → {HANA_HOST}:{HANA_PORT}")
         return conn
@@ -150,23 +149,19 @@ def get_connection():
 # =============================================================================
 
 def create_tables():
-    """
-    Crea las tablas RAW_LOGS_SISTEMA y RAW_LOGS_LLM en HANA si no existen.
-
-    Es idempotente — puedes llamarla N veces sin error ni duplicados.
-    Si las tablas ya existen, no hace nada.
-
-    Tipos de datos HANA usados:
-        NVARCHAR(n)  → strings Unicode
-        TIMESTAMP    → fecha y hora con precisión de microsegundos
-        INTEGER      → entero 32-bit
-        DOUBLE       → decimal de doble precisión
-    """
     conn   = get_connection()
     cursor = conn.cursor()
 
+    # ── Verificar si una tabla ya existe ────────────────────────────
+    def tabla_existe(nombre_tabla):
+        cursor.execute(
+            "SELECT COUNT(*) FROM TABLES WHERE TABLE_NAME = ?",
+            (nombre_tabla,)
+        )
+        return cursor.fetchone()[0] > 0
+
     sql_sistema = f"""
-        CREATE TABLE IF NOT EXISTS {TABLA_SISTEMA} (
+        CREATE TABLE {TABLA_SISTEMA} (
             id              INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             log_id          NVARCHAR(100),
             event_timestamp TIMESTAMP,
@@ -187,7 +182,7 @@ def create_tables():
     """
 
     sql_llm = f"""
-        CREATE TABLE IF NOT EXISTS {TABLA_LLM} (
+        CREATE TABLE {TABLA_LLM} (
             id                  INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             log_id              NVARCHAR(100),
             event_timestamp     TIMESTAMP,
@@ -213,11 +208,17 @@ def create_tables():
     """
 
     try:
-        cursor.execute(sql_sistema)
-        logger.info(f"✓ Tabla {TABLA_SISTEMA} lista")
+        if tabla_existe(TABLA_SISTEMA):
+            logger.info(f"✓ Tabla {TABLA_SISTEMA} ya existe")
+        else:
+            cursor.execute(sql_sistema)
+            logger.info(f"✓ Tabla {TABLA_SISTEMA} creada")
 
-        cursor.execute(sql_llm)
-        logger.info(f"✓ Tabla {TABLA_LLM} lista")
+        if tabla_existe(TABLA_LLM):
+            logger.info(f"✓ Tabla {TABLA_LLM} ya existe")
+        else:
+            cursor.execute(sql_llm)
+            logger.info(f"✓ Tabla {TABLA_LLM} creada")
 
         conn.commit()
         logger.info("✓ Setup de tablas completado")
@@ -230,7 +231,6 @@ def create_tables():
     finally:
         cursor.close()
         conn.close()
-
 
 # =============================================================================
 # FUNCIÓN: insert_logs()
