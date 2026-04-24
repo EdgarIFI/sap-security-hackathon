@@ -87,7 +87,7 @@ logger.addHandler(console_handler)
 
 SEGUNDOS_REINTENTO   = 60
 ERRORES_FATALES_HTTP = {401}
-
+INTERVALO_POLLING    = 60*5   # polling cada 5 minutos
 
 # =============================================================================
 # FUNCIÓN: calcular_segundos_hasta_proxima_ventana()
@@ -127,10 +127,7 @@ def formatear_tiempo(segundos: int) -> str:
 
 def ejecutar_ciclo_ingesta(numero_ciclo: int) -> bool:
     """
-    Ejecuta un ciclo completo: extracción → CSV → HANA (si disponible).
-
-    Llama a ingest_and_persist() que maneja todo internamente.
-    Clasifica errores en recuperables (retorna False) y fatales (sys.exit).
+    Ejecuta un ciclo completo: extracción → deduplicación → UPSERT → filtro rápido.
 
     Returns:
         True  → éxito
@@ -141,11 +138,10 @@ def ejecutar_ciclo_ingesta(numero_ciclo: int) -> bool:
     logger.info(f"{'─' * 50}")
 
     try:
-        # ingest_and_persist() orquesta todo: API → CSV → HANA
         resultado = ingest_and_persist()
 
         logger.info(f"Ventana: {resultado['ventana_inicio']} → {resultado['ventana_fin']}")
-        logger.info(f"Registros: {resultado['registros']:,}")
+        logger.info(f"Registros: {resultado['registros']:,} | Nuevos: {resultado['nuevos']:,}")
         logger.info(f"CSV: {resultado['csv']}")
 
         if resultado.get("hana"):
@@ -154,7 +150,17 @@ def ejecutar_ciclo_ingesta(numero_ciclo: int) -> bool:
                 f"{resultado['hana']['llm']:,} LLM"
             )
         else:
-            logger.info("HANA: no configurado o no disponible — solo CSV")
+            logger.info("HANA: no disponible — solo CSV")
+
+        # ── Filtro rápido sobre registros nuevos ─────────────────────
+        # Cuando quick_filter.py esté listo, descomentar:
+        # df_nuevos = resultado.get("df_nuevos")
+        # if df_nuevos is not None and not df_nuevos.empty:
+        #     from quick_filter import analizar
+        #     alertas = analizar(df_nuevos)
+        #     if alertas:
+        #         from alerting import enviar_alertas
+        #         enviar_alertas(alertas)
 
         logger.info(f"CICLO #{numero_ciclo} completado exitosamente")
         return True
@@ -190,11 +196,12 @@ def main():
     ahora_utc = datetime.now(timezone.utc)
 
     logger.info("=" * 60)
-    logger.info("PIPELINE LOOP — Ingesta automática SAP + HANA")
+    logger.info("PIPELINE LOOP — Ingesta continua SAP + HANA (polling 2 min)")
     logger.info(
         f"Iniciado: {ahora_utc.strftime('%Y-%m-%d %H:%M:%S')} UTC  "
         f"({hora_completa_monterrey(ahora_utc)} Monterrey)"
     )
+    logger.info(f"Intervalo de polling: {INTERVALO_POLLING // 60} minutos")
     logger.info(f"Log en: {LOG_FILE}")
     logger.info("Ctrl+C para detener")
     logger.info("=" * 60)
@@ -208,8 +215,7 @@ def main():
 
     numero_ciclo = 0
 
-    # Primera ejecución inmediata — captura ventana actual sin esperar
-    logger.info("Primera ingesta inmediata...")
+    # Primera ejecución inmediata — captura lo que hay ahora
     numero_ciclo += 1
     exito = ejecutar_ciclo_ingesta(numero_ciclo)
 
@@ -219,18 +225,16 @@ def main():
         numero_ciclo += 1
         ejecutar_ciclo_ingesta(numero_ciclo)
 
-    # Loop infinito sincronizado con ventanas UTC
+    # Loop continuo — polling cada 2 minutos
     while True:
-        segundos_espera, proxima_ventana = calcular_segundos_hasta_proxima_ventana()
-
+        ahora_utc = datetime.now(timezone.utc)
         logger.info(
-            f"Próxima ventana: {proxima_ventana.strftime('%H:%M:%S')} UTC  "
-            f"({hora_monterrey(proxima_ventana)} Monterrey)  "
-            f"(en {formatear_tiempo(segundos_espera)})"
+            f"Próximo polling en {INTERVALO_POLLING // 60} min  "
+            f"({hora_monterrey(ahora_utc)} Monterrey)"
         )
 
         try:
-            time.sleep(segundos_espera)
+            time.sleep(INTERVALO_POLLING)
         except KeyboardInterrupt:
             ahora_utc = datetime.now(timezone.utc)
             logger.info("")
@@ -251,7 +255,6 @@ def main():
             logger.warning(f"Ciclo #{numero_ciclo} falló. Reintento en {SEGUNDOS_REINTENTO}s...")
             time.sleep(SEGUNDOS_REINTENTO)
             ejecutar_ciclo_ingesta(numero_ciclo)
-
 
 # =============================================================================
 # PUNTO DE ENTRADA

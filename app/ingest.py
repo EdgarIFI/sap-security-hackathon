@@ -57,7 +57,7 @@ HANA_DISPONIBLE = bool(HANA_HOST)
 
 if HANA_DISPONIBLE:
     try:
-        from hana_client import insert_logs, create_tables
+        from hana_client import upsert_logs, hana_esta_viva, create_tables
         logger.info("✓ Módulo HANA cargado — datos se guardarán en HANA y CSV")
     except Exception as e:
         logger.warning(f"⚠️  No se pudo cargar hana_client: {e} — solo CSV")
@@ -65,6 +65,17 @@ if HANA_DISPONIBLE:
 else:
     logger.info("ℹ️  HANA_HOST no configurado — solo guardado en CSV local")
 
+# -----------------------------------------------------------------------------
+# Estado de deduplicación en memoria
+# -----------------------------------------------------------------------------
+# ids_procesados guarda los _id de registros que ya pasaron por el pipeline
+# en esta ventana. Evita re-procesar registros en cada polling de 2 minutos.
+#
+# ventana_anterior detecta cuándo cambia la ventana UTC de 30 minutos.
+# Al cambiar, se resetea ids_procesados porque la API empieza con datos nuevos.
+
+ids_procesados = set()
+ventana_anterior = None
 
 # =============================================================================
 # FUNCIÓN: fetch_current_window()
@@ -182,51 +193,79 @@ def save_data(df: pd.DataFrame, meta: dict) -> str:
 
 def ingest_and_persist() -> dict:
     """
-    Función principal que orquesta: extracción → CSV → HANA.
+    Función principal que orquesta: extracción → deduplicación → CSV → HANA.
 
-    Esta es la función que llama pipeline_loop.py en cada ciclo.
-    CSV siempre se guarda primero como garantía. HANA es adicional.
-    Si HANA falla, el ciclo NO muere — los datos ya están en CSV.
+    Cambios respecto a la versión anterior:
+        - Deduplicación en memoria: solo registros nuevos pasan al UPSERT
+        - UPSERT (MERGE INTO) en vez de INSERT: HANA ignora duplicados
+        - hana_esta_viva(): verifica HANA antes de intentar escribir
+        - Retorna df_nuevos para que pipeline_loop lo pase al filtro rápido
 
     Returns:
         dict:
         {
-            "registros":      N,
+            "registros":      N,          ← total de la API
+            "nuevos":         M,          ← solo los nuevos de este polling
             "ventana_inicio": "...",
             "ventana_fin":    "...",
-            "csv":            "ruta/al/archivo.csv",
-            "hana":           {"sistema": N, "llm": M} o None
+            "csv":            "ruta/...",
+            "hana":           {"sistema": N, "llm": M} o None,
+            "df_nuevos":      DataFrame,  ← para el filtro rápido
         }
     """
-    # Extracción
-    df, meta = fetch_current_window()
+    global ids_procesados, ventana_anterior
 
-    # CSV local — siempre, independiente de HANA
+    # ── Extracción completa de la ventana ────────────────────────────────────
+    df, meta = fetch_current_window()
+    ventana_actual = meta.get("window_start")
+
+    # ── Detectar cambio de ventana → resetear estado ─────────────────────────
+    if ventana_actual != ventana_anterior:
+        logger.info(f"Nueva ventana detectada: {ventana_actual}")
+        logger.info(f"  Ventana anterior: {ventana_anterior}")
+        ids_procesados = set()
+        ventana_anterior = ventana_actual
+
+    # ── Deduplicación en memoria ─────────────────────────────────────────────
+    df_nuevos = df[~df["_id"].isin(ids_procesados)]
+    ids_procesados.update(df_nuevos["_id"].tolist())
+
+    logger.info(
+        f"Deduplicación: {len(df):,} totales → "
+        f"{len(df_nuevos):,} nuevos | "
+        f"{len(ids_procesados):,} procesados en esta ventana"
+    )
+
+    # ── CSV local — siempre, independiente de HANA ───────────────────────────
     ruta_csv = save_data(df, meta)
 
     resultado = {
         "registros":      len(df),
-        "ventana_inicio": meta.get("window_start"),
+        "nuevos":         len(df_nuevos),
+        "ventana_inicio": ventana_actual,
         "ventana_fin":    meta.get("window_end"),
         "csv":            ruta_csv,
         "hana":           None,
+        "df_nuevos":      df_nuevos,
     }
 
-    # HANA — opcional, no bloquea el pipeline si falla
-    if HANA_DISPONIBLE:
-        try:
-            conteos_hana = insert_logs(df)
-            resultado["hana"] = conteos_hana
-            logger.info(
-                f"✓ HANA: {conteos_hana['sistema']:,} sistema + "
-                f"{conteos_hana['llm']:,} LLM"
-            )
-        except Exception as e:
-            logger.error(f"⚠️  Error insertando en HANA: {e}")
-            logger.warning("Datos guardados en CSV. HANA se reintentará próximo ciclo.")
+    # ── HANA — UPSERT solo registros nuevos ──────────────────────────────────
+    if HANA_DISPONIBLE and not df_nuevos.empty:
+        if hana_esta_viva():
+            try:
+                conteos_hana = upsert_logs(df_nuevos)
+                resultado["hana"] = conteos_hana
+                logger.info(
+                    f"✓ HANA: {conteos_hana['sistema']:,} sistema + "
+                    f"{conteos_hana['llm']:,} LLM"
+                )
+            except Exception as e:
+                logger.error(f"⚠️  Error UPSERT en HANA: {e}")
+                logger.warning("Datos en CSV. HANA se reintentará próximo ciclo.")
+        else:
+            logger.warning("⚠️  HANA no disponible — datos solo en CSV")
 
     return resultado
-
 
 # =============================================================================
 # PUNTO DE ENTRADA — ejecución directa para pruebas

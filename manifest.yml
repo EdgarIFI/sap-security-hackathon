@@ -1,80 +1,70 @@
 # =============================================================================
 # manifest.yml
 # =============================================================================
-# Propósito: decirle a Cloud Foundry cómo desplegar y correr nuestra aplicación.
-#
-# Este archivo es el equivalente a las "instrucciones de instalación" para CF.
-# Cuando ejecutas "cf push", CF lee este archivo y configura todo automáticamente.
+# Propósito: decirle a Cloud Foundry cómo desplegar y correr la aplicación.
 #
 # Cómo usarlo:
 #   cf push
 #   (CF busca manifest.yml en la carpeta actual automáticamente)
 #
-# Variables de entorno:
-#   Las credenciales NO van hardcodeadas aquí.
-#   Se configuran en CF con: cf set-env sap-ai-soc NOMBRE_VARIABLE valor
-#   CF las inyecta al proceso automáticamente al arrancar.
+# SEGURIDAD:
+#   Este archivo NO contiene credenciales ni referencias a secretos.
+#   Es seguro para Git.
+#
+#   Credenciales de HANA:
+#     Se inyectan automáticamente via VCAP_SERVICES gracias al
+#     service binding declarado en la sección "services:" abajo.
+#     config.py detecta VCAP_SERVICES y lee las credenciales de ahí.
+#
+#   Credenciales externas (API, token de seguridad):
+#     Se configuran DESPUÉS del push con cf set-env:
+#
+#       cf set-env sap-ai-soc BEARER_TOKEN     "token-del-equipo"
+#       cf set-env sap-ai-soc API_BASE_URL     "url-de-la-api"
+#       cf set-env sap-ai-soc JOB_SECRET_TOKEN "uuid-aleatorio"
+#       cf restage sap-ai-soc
+#
+#   NUNCA agregar sección env: con valores de credenciales aquí.
 # =============================================================================
 
 applications:
   - name: sap-ai-soc
-    # Nombre de la aplicación en Cloud Foundry
-    # Debe ser único en tu organización
+    # Nombre de la aplicación en Cloud Foundry.
+    # Debe ser único en tu organización.
 
     memory: 512M
-    # RAM asignada al proceso
-    # 512MB es suficiente para el pipeline de ingesta con pandas
-    # Si el modelo ML es pesado, aumentar a 1024M
+    # RAM asignada al proceso.
+    # 512MB es suficiente para el pipeline con pandas.
+    # Si el modelo ML es pesado, aumentar a 1024M.
 
     disk_quota: 1G
-    # Espacio en disco para los CSV locales temporales
-    # Los datos permanentes van a HANA, pero necesitamos espacio para data/raw/
+    # Espacio en disco para CSVs temporales.
+    # Los datos permanentes van a HANA.
 
     instances: 1
-    # Número de instancias del proceso
-    # 1 es suficiente — múltiples instancias harían ingesta duplicada
+    # Número de instancias del proceso.
+    # DEBE ser 1 — múltiples instancias harían ingesta duplicada
+    # y romperían la deduplicación en memoria.
 
     buildpacks:
       - python_buildpack
-    # Le dice a CF que esto es una aplicación Python
-    # CF instala automáticamente todo lo que está en requirements.txt
+    # CF detecta que es Python e instala requirements.txt.
 
     command: python pipeline_loop.py
-    # El comando que CF ejecuta para arrancar la aplicación
-    # Es exactamente el mismo comando que usas localmente
+    # Entry point de la aplicación.
+    # pipeline_loop.py corre el polling cada 1-2 minutos.
+    # Es el mismo comando que usas localmente.
 
     health-check-type: process
-    # Cómo CF verifica que la app está viva
-    # "process" = la app está viva si el proceso Python sigue corriendo
-    # (no usamos "http" porque no tenemos un servidor web, solo un loop)
+    # CF verifica que el proceso Python sigue corriendo.
+    # "process" porque pipeline_loop.py es un loop, no un servidor HTTP.
 
-    env:
-      # Variables de entorno inyectadas por CF al proceso
-      # Los valores reales se configuran con: cf set-env sap-ai-soc NOMBRE valor
-      # Aquí solo declaramos los nombres para documentar qué se necesita
+    services:
+      - pyhana
+      # Instancia de SAP HANA Cloud.
+      # Este nombre DEBE coincidir exactamente con la salida de: cf services
+      # El binding inyecta VCAP_SERVICES con host, port, user, password.
 
-      API_BASE_URL: ""
-      # URL base de la API del hackathon
-      # Configurar con: cf set-env sap-ai-soc API_BASE_URL https://sap-api-b4.674318.xyz
-
-      BEARER_TOKEN: ""
-      # Token de autenticación del equipo
-      # Configurar con: cf set-env sap-ai-soc BEARER_TOKEN tu-token-aqui
-
-      WEBHOOK_URL: ""
-      # URL del webhook de alerting (disponible Abr 27)
-      # Configurar con: cf set-env sap-ai-soc WEBHOOK_URL https://...
-
-      HANA_HOST: ""
-      # Host de SAP HANA Cloud
-      # Configurar con: cf set-env sap-ai-soc HANA_HOST tu-host.hanacloud.ondemand.com
-
-      HANA_PORT: "443"
-      # Puerto de HANA Cloud (443 para conexión cifrada)
-
-      HANA_USER: "DBADMIN"
-      # Usuario de HANA
-
-      HANA_PASSWORD: ""
-      # Contraseña de HANA
-      # Configurar con: cf set-env sap-ai-soc HANA_PASSWORD tu-password
+      - pyuaa
+      # Instancia de XSUAA (Authorization and Trust Management).
+      # Necesaria para autenticación de servicios en BTP.

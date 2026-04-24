@@ -72,8 +72,8 @@ except ImportError:
 # CONSTANTES
 # =============================================================================
 
-TABLA_SISTEMA = "RAW_LOGS_SISTEMA"
-TABLA_LLM     = "RAW_LOGS_LLM"
+TABLA_SISTEMA = "DBADMIN.RAW_LOGS_SISTEMA"
+TABLA_LLM     = "DBADMIN.RAW_LOGS_LLM"
 PREFIJO_LLM   = "LLM"
 
 
@@ -143,6 +143,37 @@ def get_connection():
         )
         raise
 
+
+# =============================================================================
+# FUNCIÓN: hana_esta_viva()
+# =============================================================================
+
+def hana_esta_viva() -> bool:
+    """
+    Verifica si HANA Cloud está accesible.
+
+    Ejecuta un query trivial (SELECT 1 FROM DUMMY) que HANA
+    siempre puede responder si está activa. DUMMY es una tabla
+    del sistema que siempre existe y tiene una sola fila.
+
+    No lanza excepciones — retorna True o False.
+    Usar antes de cada ciclo para decidir si persistir en HANA
+    o continuar solo con logging de advertencia.
+
+    Returns:
+        True  → HANA accesible y respondiendo
+        False → HANA caída, pausada o inaccesible
+    """
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM DUMMY")
+        cursor.close()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.warning(f"⚠️  HANA no responde: {e}")
+        return False
 
 # =============================================================================
 # FUNCIÓN: create_tables()
@@ -233,43 +264,71 @@ def create_tables():
         conn.close()
 
 # =============================================================================
-# FUNCIÓN: insert_logs()
+# FUNCIÓN: upsert_logs() antes era insert, pero cambió por la lógica de la APP, ver más en Contexto Actualisado abr 23
 # =============================================================================
 
-def insert_logs(df: pd.DataFrame) -> dict:
+def upsert_logs(df_nuevos: pd.DataFrame) -> dict:
     """
-    Inserta todos los registros del DataFrame en HANA.
+    Inserta registros nuevos en HANA usando SELECT previo + executemany().
 
-    Separa automáticamente Sistema y LLM e inserta cada grupo
-    en su tabla usando executemany() para máxima eficiencia.
+    Flujo:
+        1. SELECT log_id de ambas tablas → obtener IDs ya existentes en HANA
+        2. Filtrar df_nuevos en Python   → quedarse solo con los no existentes
+        3. executemany() INSERT          → insertar todos en batch (O(1) queries)
 
-    Por qué executemany() y no un INSERT por fila:
-        Con ~5,729 registros, un INSERT individual por fila significaría
-        5,729 llamadas SQL. executemany() las agrupa en una sola operación,
-        reduciendo el tiempo de minutos a segundos.
+    Por qué este enfoque en vez de MERGE fila por fila:
+        MERGE individual: N queries SQL para N registros → ~9 min para 5,500 filas
+        SELECT + executemany: 2 queries totales          → ~1 min para 5,500 filas
+
+    Es seguro porque:
+        - instances: 1 en manifest.yml → no hay concurrencia entre procesos
+        - ids_procesados en ingest.py  → primera capa de deduplicación en memoria
+        - Este SELECT es la segunda capa → seguro contra reinicios de CF
 
     Args:
-        df: DataFrame completo con logs de la ventana actual
+        df_nuevos: DataFrame con registros a insertar (ya filtrados en memoria)
 
     Returns:
         dict: {"sistema": N, "llm": M}
     """
-    if df.empty:
-        logger.warning("DataFrame vacío — nada que insertar en HANA")
+    if df_nuevos.empty:
+        logger.info("Sin registros nuevos para HANA")
         return {"sistema": 0, "llm": 0}
 
-    conn   = get_connection()
-    cursor = conn.cursor()
-
+    conn    = get_connection()
+    cursor  = conn.cursor()
     ahora   = datetime.now(timezone.utc)
     conteos = {"sistema": 0, "llm": 0}
 
     try:
-        mask_llm   = df["sap_function_log_type"].str.startswith(PREFIJO_LLM, na=False)
-        df_sistema = df[~mask_llm]
-        df_llm     = df[mask_llm]
+        # ── PASO 1: Obtener IDs ya existentes en HANA ────────────────────────
+        # Un solo SELECT por tabla — mucho más eficiente que verificar fila por fila.
+        # Con el índice UNIQUE en log_id este query es casi instantáneo.
+        ids_hana = set()
+        for tabla in [TABLA_SISTEMA, TABLA_LLM]:
+            cursor.execute(f"SELECT log_id FROM {tabla}")
+            ids_hana.update(row[0] for row in cursor.fetchall())
 
-        # ── Logs de Sistema ───────────────────────────────────────────────────
+        logger.info(f"  IDs existentes en HANA: {len(ids_hana):,}")
+
+        # ── PASO 2: Filtrar en Python ─────────────────────────────────────────
+        # Comparación de sets en memoria — instantáneo sin importar el volumen.
+        df_insertar = df_nuevos[~df_nuevos["_id"].isin(ids_hana)]
+
+        if df_insertar.empty:
+            logger.info("  Sin registros nuevos después de verificar HANA")
+            return {"sistema": 0, "llm": 0}
+
+        logger.info(f"  Registros a insertar: {len(df_insertar):,}")
+
+        # ── PASO 3: Separar Sistema y LLM ─────────────────────────────────────
+        mask_llm   = df_insertar["sap_function_log_type"].str.startswith(PREFIJO_LLM, na=False)
+        df_sistema = df_insertar[~mask_llm]
+        df_llm     = df_insertar[mask_llm]
+
+        # ── PASO 4: INSERT masivo Sistema ────────────────────────────────────
+        # executemany() envía todas las filas en una sola operación SQL.
+        # O(1) en llamadas al servidor independientemente del número de filas.
         if not df_sistema.empty:
             filas_sistema = [
                 (
@@ -303,9 +362,9 @@ def insert_logs(df: pd.DataFrame) -> dict:
             """, filas_sistema)
 
             conteos["sistema"] = len(filas_sistema)
-            logger.info(f"  ✓ Sistema: {conteos['sistema']:,} registros")
+            logger.info(f"  ✓ Sistema: {conteos['sistema']:,} registros insertados")
 
-        # ── Logs de LLM ───────────────────────────────────────────────────────
+        # ── PASO 5: INSERT masivo LLM ─────────────────────────────────────────
         if not df_llm.empty:
             filas_llm = [
                 (
@@ -347,8 +406,9 @@ def insert_logs(df: pd.DataFrame) -> dict:
             """, filas_llm)
 
             conteos["llm"] = len(filas_llm)
-            logger.info(f"  ✓ LLM: {conteos['llm']:,} registros")
+            logger.info(f"  ✓ LLM: {conteos['llm']:,} registros insertados")
 
+        # ── PASO 6: Commit ────────────────────────────────────────────────────
         conn.commit()
         logger.info(f"  ✓ Total HANA: {conteos['sistema'] + conteos['llm']:,}")
 
@@ -362,7 +422,6 @@ def insert_logs(df: pd.DataFrame) -> dict:
         conn.close()
 
     return conteos
-
 
 # =============================================================================
 # FUNCIONES AUXILIARES DE CONVERSIÓN SEGURA
