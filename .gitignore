@@ -241,3 +241,6 @@ tests/soc-key.json
 
 # Carpeta VS Code
 .vscode/
+
+# Ignorando entradas directas para CF
+.cfignore

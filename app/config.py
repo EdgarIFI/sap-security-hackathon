@@ -92,45 +92,49 @@ import json
 
 def _load_hana_creds() -> dict:
     """
-    Lee credenciales HANA del entorno correcto según dónde corre el código.
-
-    Returns:
-        dict con host, port, user, password
-        Valores pueden ser None si no están configurados — 
-        detectado después por hana_client.py
+    Lee credenciales HANA con tres niveles de fallback:
+    1. Variables de entorno directas (cf set-env o .env)  ← prioridad máxima
+    2. VCAP_SERVICES con user directo                     ← instancia tipo trial
+    3. Retorna vacío → hana_client detectará que faltan   ← falla controlada
     """
-    vcap_raw = os.getenv("VCAP_SERVICES")
 
-    if vcap_raw:
-        # ── Entorno Cloud Foundry ────────────────────────────────────────
-        # CF inyecta VCAP_SERVICES con las credenciales de todos los
-        # servicios vinculados. La key puede variar según el tipo de binding.
-        try:
-            vcap     = json.loads(vcap_raw)
-            # Intentar las dos keys posibles para HANA Cloud
-            servicios_hana = vcap.get("hana", vcap.get("hana-cloud", []))
-            if not servicios_hana:
-                raise EnvironmentError(
-                    "VCAP_SERVICES existe pero no contiene credenciales HANA.\n"
-                    "Verifica que el Service Binding está configurado en manifest.yml"
-                )
-            creds = servicios_hana[0]["credentials"]
-            return {
-                "host":     creds.get("host"),
-                "port":     creds.get("port", "443"),
-                "user":     creds.get("user"),
-                "password": creds.get("password"),
-            }
-        except (json.JSONDecodeError, KeyError) as e:
-            raise EnvironmentError(f"Error leyendo VCAP_SERVICES: {e}")
-    else:
-        # ── Entorno local (.env) ─────────────────────────────────────────
+    # ── Prioridad 1: variables de entorno directas ───────────────────
+    # Cubre tanto cf set-env en CF como .env en local
+    # Si están presentes, las usamos sin importar VCAP_SERVICES
+    if os.getenv("HANA_HOST") and os.getenv("HANA_USER"):
         return {
             "host":     os.getenv("HANA_HOST"),
             "port":     os.getenv("HANA_PORT", "443"),
             "user":     os.getenv("HANA_USER"),
             "password": os.getenv("HANA_PASSWORD"),
         }
+
+    # ── Prioridad 2: VCAP_SERVICES con user directo ──────────────────
+    # Cubre instancias HANA con binding estándar (usuario/password)
+    vcap_raw = os.getenv("VCAP_SERVICES")
+    if vcap_raw:
+        try:
+            vcap = json.loads(vcap_raw)
+            servicios_hana = vcap.get("hana", vcap.get("hana-cloud", []))
+            if servicios_hana:
+                creds = servicios_hana[0]["credentials"]
+                if creds.get("user"):
+                    return {
+                        "host":     creds.get("host"),
+                        "port":     creds.get("port", "443"),
+                        "user":     creds.get("user"),
+                        "password": creds.get("password"),
+                    }
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # ── Prioridad 3: fallback vacío ───────────────────────────────────
+    return {
+        "host":     os.getenv("HANA_HOST", ""),
+        "port":     os.getenv("HANA_PORT", "443"),
+        "user":     os.getenv("HANA_USER", ""),
+        "password": os.getenv("HANA_PASSWORD", ""),
+    }
 
 
 # Cargar credenciales HANA según el entorno detectado

@@ -87,7 +87,7 @@ logger.addHandler(console_handler)
 
 SEGUNDOS_REINTENTO   = 60
 ERRORES_FATALES_HTTP = {401}
-INTERVALO_POLLING    = 60*5   # polling cada 5 minutos
+INTERVALO_POLLING    = 60*29   # polling cada 29 minutos
 
 # =============================================================================
 # FUNCIÓN: calcular_segundos_hasta_proxima_ventana()

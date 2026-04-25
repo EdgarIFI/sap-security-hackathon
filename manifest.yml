@@ -28,16 +28,16 @@
 # =============================================================================
 
 applications:
-  - name: sap-ai-soc
+  - name: sap-ai-soc-papoi
     # Nombre de la aplicación en Cloud Foundry.
     # Debe ser único en tu organización.
 
-    memory: 512M
+    memory: 1024M
     # RAM asignada al proceso.
     # 512MB es suficiente para el pipeline con pandas.
     # Si el modelo ML es pesado, aumentar a 1024M.
 
-    disk_quota: 1G
+    disk_quota: 2G
     # Espacio en disco para CSVs temporales.
     # Los datos permanentes van a HANA.
 
@@ -60,7 +60,7 @@ applications:
     # "process" porque pipeline_loop.py es un loop, no un servidor HTTP.
 
     services:
-      - pyhana
+      - sap-soc-hana
       # Instancia de SAP HANA Cloud.
       # Este nombre DEBE coincidir exactamente con la salida de: cf services
       # El binding inyecta VCAP_SERVICES con host, port, user, password.
