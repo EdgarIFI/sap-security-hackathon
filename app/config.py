@@ -62,7 +62,10 @@ BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 
 # URL del webhook para envío de alertas (disponible desde Abr 27)
 # Ejemplo en .env:  WEBHOOK_URL=https://webhook.site/...
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+# WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+# WEBHOOK_URL fue removida — el alerting usa POST /alert en API_BASE_URL
+# con el mismo BEARER_TOKEN. No se necesita URL ni credencial adicional.
 
 # Credenciales de SAP HANA (las provee el Data Architect una vez configurada la instancia)
 #HANA_HOST     = os.getenv("HANA_HOST")

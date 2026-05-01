@@ -361,6 +361,8 @@ def upsert_logs(df_nuevos: pd.DataFrame) -> dict:
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, filas_sistema)
 
+# la columna http_status_code se renombra a http_status al insertarse en HANA (línea 358). Esto no afecta quick_filter porque opera antes del insert, pero es bueno documentarlo explícitamente en el código para que nadie se confunda si en el futuro alguien intenta leer de HANA en lugar de df_nuevos.
+
             conteos["sistema"] = len(filas_sistema)
             logger.info(f"  ✓ Sistema: {conteos['sistema']:,} registros insertados")
 
