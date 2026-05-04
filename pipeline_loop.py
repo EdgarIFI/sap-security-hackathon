@@ -109,6 +109,38 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
+# =============================================================================
+# CONEXIÓN HANA — para el bloque de alerting
+# =============================================================================
+
+def _abrir_conexion_hana():
+    """
+    Abre una conexión HANA usando las credenciales de config.py.
+    Retorna la conexión si tiene éxito, None si falla (sin lanzar excepción).
+    El pipeline nunca debe morir por no poder conectar a HANA para alerting.
+    """
+    try:
+        from config import HANA_HOST, HANA_PORT, HANA_USER, HANA_PASSWORD
+        import hdbcli.dbapi as hdb
+        conn = hdb.connect(
+            address=HANA_HOST,
+            port=int(HANA_PORT),
+            user=HANA_USER,
+            password=HANA_PASSWORD,
+        )
+        return conn
+    except Exception as e:
+        logger.warning(f"[HANA] No se pudo abrir conexión para alerting: {e}")
+        return None
+
+
+def _cerrar_conexion_hana(conn):
+    """Cierra la conexión HANA silenciosamente."""
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 # =============================================================================
 # CONSTANTES
@@ -335,22 +367,18 @@ def ejecutar_ciclo_ingesta(numero_ciclo: int) -> bool:
         else:
             logger.info("HANA: no disponible en este ciclo — datos en CSV")
 
-        # ── DETECT + RESPOND: quick_filter → alerting ─────────────────────────
-        # conn=None porque ingest_and_persist() ya cerró su conexión HANA.
-        # alerting.py verifica duplicados en HANA abriendo su propia conexión
-        # si HANA está disponible.
-        #
-        # Nota: para pasar conn activa aquí necesitaríamos refactorizar
-        # ingest_and_persist() para que retorne la conexión — lo dejamos
-        # como mejora futura. Por ahora alerting.py funciona con conn=None
-        # (sin anti-duplicados en HANA, pero el loop de deduplicación en
-        # memoria de ingest.py ya previene df_nuevos duplicados).
+# ── DETECT + RESPOND: quick_filter → alerting ─────────────────────────
         if df_nuevos is not None and not df_nuevos.empty:
-            resumen_alertas = ejecutar_deteccion_y_alertas(
-                df_nuevos      = df_nuevos,
-                ventana_inicio = ventana_inicio,
-                conn           = None,   # ver nota arriba
-            )
+            # Abrir conexión HANA dedicada para registrar alertas en DBADMIN.ALERTS
+            conn_alerting = _abrir_conexion_hana()
+            try:
+                resumen_alertas = ejecutar_deteccion_y_alertas(
+                    df_nuevos      = df_nuevos,
+                    ventana_inicio = ventana_inicio,
+                    conn           = conn_alerting,   # ← ahora sí pasa conn real
+                )
+            finally:
+                _cerrar_conexion_hana(conn_alerting)
         else:
             logger.info("[DETECT] Sin registros nuevos — omitiendo detección")
             resumen_alertas = {
