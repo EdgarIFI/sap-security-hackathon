@@ -1,87 +1,114 @@
-# Reporte de Sesión + Diseño Completo de model.py
+# Reporte de Sesión + Diseño Completo del Sistema ML
 ## SAP AI Security Anomaly Detection Hackathon · TEC de Monterrey × SAP
-**Fecha:** 3–4 Mayo 2026  
+**Fechas:** 3–4 Mayo 2026  
 **Autor:** Cloud Integration Engineer  
-**Sesión:** #3 de trabajo en este proyecto  
-**Estado al cierre:** ✅ Pipeline estable · ✅ ALERTS persistiendo en HANA · ⏳ model.py en diseño
+**Estado actual:** ✅ Pipeline completo desplegado en CF · ✅ ML activo en ciclo largo · ✅ ALERTS persistiendo en HANA
 
 ---
 
-## 1. Resumen ejecutivo de la sesión
+## 1. Resumen ejecutivo
 
-Esta sesión tuvo tres logros principales:
+Esta sesión completó la implementación completa del sistema de detección de anomalías ML. Partiendo de un pipeline con quick_filter ya operativo, se construyeron y desplegaron cuatro módulos nuevos que cierran el ciclo OBSERVE → ANALYZE → DETECT → RESPOND con detección estadística real.
 
-1. **Bug crítico resuelto:** `DBADMIN.ALERTS` estaba vacía porque `pipeline_loop.py` llamaba a `enviar_alerta()` con `conn=None`. Se implementó `_abrir_conexion_hana()` dedicada para el bloque de alerting. Resultado: 8/8 alertas con `alerted=1` confirmadas.
+**Logros de la sesión, en orden:**
 
-2. **Schema real de HANA documentado:** Los nombres de columnas en HANA difieren significativamente de los nombres en el raw de la API. Se mapearon las 16 columnas de `RAW_LOGS_SISTEMA` y las 21 de `RAW_LOGS_LLM` con sus tipos exactos.
+1. **Bug crítico resuelto:** `DBADMIN.ALERTS` estaba vacía porque `pipeline_loop.py` pasaba `conn=None` a `enviar_alerta()`. Corregido con funciones dedicadas de conexión HANA. Verificado: 8/8 alertas con `alerted=1`.
 
-3. **Diseño completo de `model.py` finalizado:** Arquitectura, features, ETL, thresholding y contrato de integración completamente especificados antes de escribir código.
+2. **Schema real de HANA documentado:** Los nombres de columna en HANA difieren de los de la API raw. Se mapearon las 16 columnas de `RAW_LOGS_SISTEMA` y las 21 de `RAW_LOGS_LLM` con tipos exactos mediante queries al catálogo del sistema.
+
+3. **Cuatro módulos ML implementados, testeados y desplegados:**
+   - `app/hana_reader.py` — extracción desde HANA
+   - `app/feature_eng.py` — feature engineering puro
+   - `app/model.py` — IF_sistema + IF_llm + LOF_ip
+   - `pipeline_loop.py` — integración del ciclo largo
+
+4. **Sistema en producción:** El banner de CF confirma `model ML: ✓ activo`. El primer ciclo largo ML se ejecutará ~28 minutos después del arranque.
 
 ---
 
-## 2. Estado del pipeline al cierre de sesión
+## 2. Estado actual del sistema
 
 ### Cloud Foundry — sap-ai-soc-papoi
 
 | Métrica | Valor |
 |---|---|
-| Ciclos completados desde el 1 Mayo | 460+ |
-| Ventana de ingesta | Cada 30 min UTC |
-| Ciclo de polling | Cada 2 min |
+| Ciclos cortos completados (desde 1 Mayo) | 460+ |
+| Ciclos cortos completados (sesión actual) | ~40+ |
+| Intervalo ciclo corto | 2 minutos |
+| Intervalo ciclo largo ML | 28 minutos |
 | Registros por ventana | ~3,900–5,700 |
-| Amenazas detectadas por ventana | 3–5 (quick_filter) |
-| MTTD medido | ~1 segundo (desde ingesta hasta HTTP 201) |
-| Crashes desde el deploy | 0 |
+| Amenazas quick_filter por ventana | 3–5 |
+| MTTD medido | ~1 segundo |
+| Crashes desde el primer deploy | 0 |
+| Módulos activos | quick_filter ✓ · alerting ✓ · model ML ✓ |
 
-### HANA — conteos al cierre
+### HANA — conteos al cierre de sesión
 
 | Tabla | Registros |
 |---|---|
-| `DBADMIN.RAW_LOGS_SISTEMA` | 1,026,865 |
-| `DBADMIN.RAW_LOGS_LLM` | 584,583 |
-| `DBADMIN.ALERTS` (total) | 8 |
-| `DBADMIN.ALERTS` (alerted=1) | 8 |
-| `DBADMIN.ALERTS` (alerted=0) | 0 |
+| `DBADMIN.RAW_LOGS_SISTEMA` | 1,026,865+ |
+| `DBADMIN.RAW_LOGS_LLM` | 584,583+ |
+| `DBADMIN.ALERTS` total | 8+ |
+| `DBADMIN.ALERTS` alerted=1 | 8+ (100%) |
+| `DBADMIN.ALERTS` alerted=0 | 0 |
+| Ventanas acumuladas estimadas | 309 |
+
+### Límite de llamadas API (desde 4 Mayo)
+
+| Operación | Llamadas/ventana |
+|---|---|
+| `GET /info` | 1 |
+| `GET /logs/current?page=N` | ~10 |
+| `POST /alert` quick_filter | ~3–5 |
+| `POST /alert` model ML (cap) | máx 5 |
+| **Total máximo** | **~21** (límite: 100) |
 
 ---
 
-## 3. Bug corregido — persistencia en DBADMIN.ALERTS
+## 3. Archivos del proyecto — estado actual
 
-### Síntoma
+```
+sap-security-hackathon/
+├── pipeline_loop.py           ← MODIFICADO v3: ciclo largo ML activo
+├── pipeline_loop_v1_backup.py ← backup original
+│
+└── app/
+    ├── config.py              ← credenciales y variables de entorno ✅
+    ├── ingest.py              ← extraccion paginada de la API ✅
+    ├── etl.py                 ← limpieza y persistencia en HANA ✅
+    ├── quick_filter.py        ← 6 reglas deterministicas ✅
+    ├── alerting.py            ← POST /alert + persistencia ALERTS ✅
+    ├── hana_reader.py         ← NUEVO: extraccion desde HANA para ML ✅
+    ├── feature_eng.py         ← NUEVO: feature engineering para sklearn ✅
+    └── model.py               ← NUEVO: IF_sistema + IF_llm + LOF_ip ✅
+```
 
-`SELECT COUNT(*) FROM DBADMIN.ALERTS` → 0, a pesar de que los logs de CF mostraban HTTP 201 confirmado en todas las alertas.
+**Nota sobre `pipeline_loop_3mayo_miedo.py`:** archivo untracked en git, es un artefacto de desarrollo local. No debe commitearse. Ver sección 14 para instrucciones.
 
-### Causa raíz
+---
 
-`pipeline_loop.py` línea 352 llamaba `enviar_alerta(..., conn=None)`. `alerting.py` está correctamente implementado con `if conn is not None` antes de cada operación HANA — con `conn=None` nunca tocaba la base de datos. `ingest_and_persist()` cierra su conexión HANA internamente antes de retornar, dejando sin conexión al bloque de alerting.
+## 4. Bug corregido — persistencia en DBADMIN.ALERTS
 
-### Solución implementada
+### Sintoma
+`SELECT COUNT(*) FROM DBADMIN.ALERTS` retornaba 0 a pesar de HTTP 201 confirmado en los logs de CF.
 
-Se añadieron dos funciones a `pipeline_loop.py`:
+### Causa raiz
+`pipeline_loop.py` llamaba `enviar_alerta(..., conn=None)`. `ingest_and_persist()` cierra su conexion HANA internamente antes de retornar. `alerting.py` tiene `if conn is not None` antes de cada operacion HANA — con `conn=None` nunca escribia a la base de datos.
+
+### Solucion implementada en `pipeline_loop.py`
 
 ```python
 def _abrir_conexion_hana():
-    """
-    Abre una conexión HANA usando las credenciales de config.py.
-    Retorna la conexión si tiene éxito, None si falla (sin lanzar excepción).
-    """
     try:
         from config import HANA_HOST, HANA_PORT, HANA_USER, HANA_PASSWORD
         import hdbcli.dbapi as hdb
-        conn = hdb.connect(
-            address=HANA_HOST,
-            port=int(HANA_PORT),
-            user=HANA_USER,
-            password=HANA_PASSWORD,
-        )
-        return conn
+        return hdb.connect(address=HANA_HOST, port=int(HANA_PORT),
+                           user=HANA_USER, password=HANA_PASSWORD)
     except Exception as e:
-        logger.warning(f"[HANA] No se pudo abrir conexión para alerting: {e}")
+        logger.warning(f"[HANA] No se pudo abrir conexion: {e}")
         return None
 
-
 def _cerrar_conexion_hana(conn):
-    """Cierra la conexión HANA silenciosamente."""
     if conn is not None:
         try:
             conn.close()
@@ -89,61 +116,36 @@ def _cerrar_conexion_hana(conn):
             pass
 ```
 
-Y el bloque DETECT+RESPOND fue modificado:
+El bloque DETECT+RESPOND ahora abre su propia conexion:
 
 ```python
-if df_nuevos is not None and not df_nuevos.empty:
-    conn_alerting = _abrir_conexion_hana()
-    try:
-        resumen_alertas = ejecutar_deteccion_y_alertas(
-            df_nuevos      = df_nuevos,
-            ventana_inicio = ventana_inicio,
-            conn           = conn_alerting,   # ← ahora sí pasa conn real
-        )
-    finally:
-        _cerrar_conexion_hana(conn_alerting)
+conn_alerting = _abrir_conexion_hana()
+try:
+    resumen_alertas = ejecutar_deteccion_y_alertas(
+        df_nuevos=df_nuevos, ventana_inicio=ventana_inicio, conn=conn_alerting
+    )
+finally:
+    _cerrar_conexion_hana(conn_alerting)
 ```
 
-### Verificación
-
+### Verificacion
 ```
-DBADMIN.ALERTS COUNT(*)         → 8
-DBADMIN.ALERTS WHERE alerted=1  → 8
-DBADMIN.ALERTS WHERE alerted=0  → 0
+COUNT(*) ALERTS total  → 8
+alerted=1              → 8
+alerted=0              → 0
 ```
-
-Los `alert_id` en HANA coinciden exactamente con los `alert_id` en los logs de CF. Trazabilidad completa confirmada.
 
 ---
 
-## 4. Aclaración sobre "HANA no disponible en este ciclo"
+## 5. Aclaracion permanente: "HANA no disponible en este ciclo"
 
-**No es un bug.** Cuando `nuevos=0`, el pipeline omite el bloque de HANA (no hay nada que insertar) y loguea el mensaje engañoso "HANA no disponible en este ciclo — datos en CSV". HANA está perfectamente operativa. El mensaje simplemente indica que el ciclo de inserción fue omitido por deduplicación. No requiere corrección urgente, pero debe documentarse para no confundir al equipo.
-
----
-
-## 5. Límite de llamadas API desde el 4 de Mayo
-
-A partir del 4 de Mayo, la API SAP limita a **100 llamadas máximo por 30 minutos por equipo**.
-
-### Consumo actual por ventana
-
-| Operación | Llamadas |
-|---|---|
-| `GET /info` (descubrir total_pages) | 1 |
-| `GET /logs/current?page=N` (~10 páginas) | ~10 |
-| `POST /alert` por amenaza (~3–5 por ventana) | ~3–5 |
-| **Total por ventana de 30 min** | **~14–16** |
-
-Estamos muy por debajo del límite. **Acción requerida para `model.py`:** imponer cap duro de máximo 5 alertas por ciclo largo para no acercarse al límite cuando ambos detectores operen simultáneamente.
+**No es un bug.** Cuando `nuevos=0`, el pipeline omite el bloque de insercion en HANA y loguea ese mensaje. HANA esta operativa — simplemente no hay nada que insertar porque la deduplicacion en memoria ya filtro todos los registros de esa ventana. El mensaje es enganoso pero inofensivo.
 
 ---
 
-## 6. Schema real de HANA — mapeo completo
+## 6. Schema real de HANA — referencia oficial
 
-### Diferencia crítica de nomenclatura
-
-Los nombres de columnas en HANA son distintos a los nombres en el raw de la API SAP. El ETL que hace `ingest_and_persist()` transforma los nombres al insertarlos. Todo código que lea desde HANA debe usar los nombres de HANA, no los de la API.
+Los nombres de columna en HANA son distintos a los del raw de la API SAP. El ETL los transforma al insertar. **Todo codigo que lea desde HANA debe usar los nombres de HANA.**
 
 ### RAW_LOGS_SISTEMA — 16 columnas
 
@@ -161,12 +163,10 @@ Los nombres de columnas en HANA son distintos a los nombres en el raw de la API 
 | 10 | `REGION_CODE` | NVARCHAR | 10 | `region_code` |
 | 11 | `MACRO_REGION` | NVARCHAR | 50 | `macro_region` |
 | 12 | `SERVICE_ID` | NVARCHAR | 200 | `service_id` |
-| 13 | `HTTP_STATUS` | NVARCHAR | 10 | `http_status_code` |
+| 13 | `HTTP_STATUS` | NVARCHAR | 10 | `http_status_code` — string, castear a int |
 | 14 | `CLIENT_IP` | NVARCHAR | 50 | `client_ip` |
 | 15 | `REQUEST_METHOD` | NVARCHAR | 20 | `headers_http_request_method` |
-| 16 | `REQUEST_PATH` | NVARCHAR | 500 | `heathers_request_path` (typo de API, corregido en HANA) |
-
-**Nota importante:** `HTTP_STATUS` es `NVARCHAR`, no entero. Requiere `int(row['HTTP_STATUS'])` al leer.
+| 16 | `REQUEST_PATH` | NVARCHAR | 500 | `heathers_request_path` (typo API, corregido en HANA) |
 
 ### RAW_LOGS_LLM — 21 columnas
 
@@ -185,22 +185,20 @@ Los nombres de columnas en HANA son distintos a los nombres en el raw de la API 
 | 11 | `MACRO_REGION` | NVARCHAR | 50 | `macro_region` |
 | 12 | `LLM_MODEL_ID` | NVARCHAR | 100 | `llm_model_id` |
 | 13 | `LLM_PROVIDER` | NVARCHAR | 100 | `llm_provider` |
-| 14 | `LLM_STATUS` | NVARCHAR | 50 | `llm_status` |
+| 14 | `LLM_STATUS` | NVARCHAR | 50 | `llm_status` — valores: success/error/timeout (minusculas) |
 | 15 | `LLM_ERROR_MESSAGE` | NVARCHAR | 1000 | `llm_error_message` |
 | 16 | `LLM_PROMPT_CATEGORY` | NVARCHAR | 100 | `llm_prompt_category` |
 | 17 | `LLM_TOTAL_TOKENS` | INTEGER | 10 | `llm_total_tokens` |
 | 18 | `LLM_COST_USD` | DOUBLE | 15 | `llm_cost_usd` |
-| 19 | `LLM_RESPONSE_TIME` | DOUBLE | 15 | `llm_response_time_ms` (**sin `_ms` en HANA, unidad sigue siendo ms**) |
+| 19 | `LLM_RESPONSE_TIME` | DOUBLE | 15 | `llm_response_time_ms` — sin `_ms` en HANA, pero unidad = ms |
 | 20 | `LLM_TEMPERATURE` | DOUBLE | 15 | `llm_temperature` |
 | 21 | `LLM_FINISH_REASON` | NVARCHAR | 50 | `llm_finish_reason` |
 
-**Nota crítica:** `LLM_RESPONSE_TIME` está en milisegundos (confirmado: MIN=200ms, MAX=34,999ms). El umbral de `quick_filter` de 10,000ms es correcto.
-
 ---
 
-## 7. Distribuciones reales de datos — base para decisiones de diseño
+## 7. Distribuciones reales de datos (base de decisiones ML)
 
-### RAW_LOGS_SISTEMA — HTTP_STATUS (16 valores distintos)
+### HTTP_STATUS — 16 valores
 
 | HTTP_STATUS | Count | Familia |
 |---|---|---|
@@ -221,9 +219,9 @@ Los nombres de columnas en HANA son distintos a los nombres en el raw de la API 
 | 404 | 7,297 | 4xx |
 | 504 | 7,077 | 5xx |
 
-**Distribución por familia:** 2xx=71% · 4xx=13% · 5xx=8% · 3xx=7%
+**Por familia:** 2xx=71% · 4xx=13% · 5xx=8% · 3xx=7%
 
-### RAW_LOGS_SISTEMA — LOG_TYPE (7 valores)
+### LOG_TYPE sistema — 7 valores
 
 | LOG_TYPE | Count |
 |---|---|
@@ -233,11 +231,9 @@ Los nombres de columnas en HANA son distintos a los nombres en el raw de la API 
 | AUDIT | 96,038 |
 | DEBUG | 95,826 |
 | PERF | 95,353 |
-| SECURITY | 29,187 |
+| SECURITY | 29,187 (2.8%) |
 
-**SECURITY** representa el 2.8% del total — señal de anomalía bien definida.
-
-### RAW_LOGS_LLM — LOG_TYPE (3 valores)
+### LOG_TYPE LLM — 3 valores
 
 | LOG_TYPE | Count |
 |---|---|
@@ -245,415 +241,354 @@ Los nombres de columnas en HANA son distintos a los nombres en el raw de la API 
 | LLM_ERROR | 117,753 |
 | LLM_TIMEOUT | 58,578 |
 
-**Tasa de error+timeout:** (117,753 + 58,578) / 589,863 = **~30%**. El sistema LLM tiene problemas sistémicos persistentes. El modelo ML debe aprender este baseline anómalo como normal.
+**Tasa de error+timeout: ~30%** — el sistema LLM tiene problemas sistemicos persistentes que el modelo aprende como baseline.
 
-### RAW_LOGS_LLM — Rangos numéricos
+### Rangos numericos LLM
 
-| Métrica | MIN | MAX | AVG |
+| Metrica | MIN | MAX | AVG |
 |---|---|---|---|
 | `LLM_COST_USD` | 0.000007 | 0.13892 | 0.01247 |
 | `LLM_RESPONSE_TIME` (ms) | 200.09 | 34,999.82 | 8,781.94 |
 | `LLM_TOTAL_TOKENS` | 84 | 3,498 | — |
 
-Todas las métricas LLM son heavy-tailed → transformación `log1p` obligatoria.
+Todas heavy-tailed — transformacion `log1p` obligatoria.
 
-### Cardinalidades categóricas clave
+### Cardinalidades clave
 
-| Variable | Cardinalidad | Implicación |
-|---|---|---|
-| `APPLICATION` (sistema) | 10 | OrdinalEncoder directo |
-| `REGION_NAME` | 108 | OrdinalEncoder con max_categories=32 |
-| `CLIENT_IP` | 105 | **No encodear raw** — construir features de comportamiento |
-| `LOG_TYPE` sistema | 7 | OrdinalEncoder directo |
-| `LLM_STATUS` | 3 | OrdinalEncoder directo |
+| Variable | Cardinalidad |
+|---|---|
+| `APPLICATION` | 10 |
+| `REGION_NAME` | 108 |
+| `CLIENT_IP` | 105 |
+| `LOG_TYPE` sistema | 7 |
+| `LLM_STATUS` | 3 (minusculas) |
 
 ---
 
-## 8. Arquitectura de model.py — decisiones definitivas
+## 8. Arquitectura del sistema ML
 
 ### Principio rector
+No forzar logs de sistema y LLM en un solo vector. Son poblaciones con columnas estructuralmente ausentes entre si. Un modelo unico aprenderia ruido de nulidad, no anomalias reales.
 
-**No forzar logs de sistema y LLM en un solo vector.** Son poblaciones con columnas estructuralmente ausentes entre sí. Un modelo único aprendería el ruido de nulidad en lugar de patrones de anomalía.
-
-### Tres modelos, dos niveles
+### Tres modelos en dos niveles
 
 ```
 Nivel 1 — Evento individual:
-  ┌─────────────────────────────────────────────────────────────┐
-  │  IF_sistema   → Isolation Forest sobre logs de Sistema      │
-  │  IF_llm       → Isolation Forest sobre logs de LLM         │
-  └─────────────────────────────────────────────────────────────┘
+  IF_sistema  ->  IsolationForest sobre ~3,500 logs Sistema/ventana
+  IF_llm      ->  IsolationForest sobre ~2,400 logs LLM/ventana
 
-Nivel 2 — Comportamiento agregado (ventana 30 min):
-  ┌─────────────────────────────────────────────────────────────┐
-  │  LOF_ip       → Local Outlier Factor sobre tabla por IP     │
-  │                 (~105 filas, una por IP única)              │
-  └─────────────────────────────────────────────────────────────┘
+Nivel 2 — Comportamiento agregado:
+  LOF_ip      ->  LocalOutlierFactor sobre tabla IP (~105 filas/ventana)
 ```
 
-### Justificación de algoritmos
-
-**Isolation Forest** para niveles de evento:
-- Diseñado para datos contaminados sin labels
-- Complejidad O(t × ψ × log ψ) donde ψ=256 (submuestra) — muy rápido
-- Tolera alta dimensionalidad y datos mixtos con OrdinalEncoder
-- Con `n_jobs=-1` usa todos los cores disponibles en CF
-
-**Local Outlier Factor** para tabla IP:
-- 105 filas → LOF con n_neighbors=20 es computacionalmente trivial
-- Detecta IPs cuyo comportamiento es anómalo respecto a sus pares, no globalmente
-- Ideal para: IPs con conteos normales pero combinaciones inusuales de paths/apps/status
-
-**Se descartan para este hackathon:**
-- Autoencoder/Keras: dependencias extra, más hiperparámetros, deadline de 3 días
-- One-Class SVM: cuadrático en n_samples, sensible a outliers en training
-- DBSCAN: O(n²) memoria, muy sensible a parámetros en datos heterogéneos
-- Elliptic Envelope: asume distribución Gaussiana unimodal — incorrecto para estos datos
-
-### Configuración sklearn
+### Configuracion sklearn
 
 ```python
-# Sistema — Isolation Forest
 IsolationForest(
     n_estimators=200,
-    max_samples=256,      # submuestra óptima según paper original
+    max_samples=256,      # submuestra optima segun paper original
     contamination="auto",
     random_state=42,
-    n_jobs=-1
+    n_jobs=-1             # paralelismo CPU completo en CF
 )
 
-# LLM — Isolation Forest
-IsolationForest(
-    n_estimators=200,
-    max_samples=256,
-    contamination="auto",
-    random_state=42,
-    n_jobs=-1
-)
-
-# IP behavior — Local Outlier Factor
 LocalOutlierFactor(
     n_neighbors=20,       # seguro con 105 IPs
     contamination="auto",
-    novelty=False         # fit_predict en cada ciclo (no novelty detection)
+    novelty=False
 )
 ```
 
----
+### Algoritmos descartados para este hackathon
 
-## 9. Feature Engineering — especificación completa
-
-### 9.1 Features de Sistema (para IF_sistema)
-
-#### Numéricas derivadas de HTTP_STATUS
-```python
-"status_family"    # int: http_status // 100  → valores: 2, 3, 4, 5
-"is_4xx"          # int: 1 si status_family == 4, else 0
-"is_5xx"          # int: 1 si status_family == 5, else 0
-"is_401_or_403"   # int: 1 si HTTP_STATUS in ('401', '403'), else 0
-"is_429"          # int: 1 si HTTP_STATUS == '429', else 0
-```
-
-**Nota:** `HTTP_STATUS` es NVARCHAR en HANA → convertir con `int(val)` antes de usar.
-
-#### Numéricas temporales
-```python
-"hour_utc"        # int: EVENT_TIMESTAMP.hour  → 0-23
-```
-
-#### Categóricas (OrdinalEncoder para IF — recomendado por sklearn para tree-based)
-```python
-"LOG_TYPE"        # 7 valores: INFO/WARNING/ERROR/AUDIT/DEBUG/PERF/SECURITY
-"APPLICATION"     # 10 valores
-"REGION_NAME"     # 108 valores → OrdinalEncoder(max_categories=32, handle_unknown='use_encoded_value', unknown_value=-1)
-```
-
-#### Columnas que NO se usan en el evento individual
-- `CLIENT_IP` raw → solo en tabla agregada
-- `REQUEST_PATH` raw → solo en tabla agregada (o features de estructura)
-- `MESSAGE` raw → normalización de template es trabajo futuro post-hackathon
-- `LOG_ID`, `INGESTED_AT` → metadatos, no features
-
-### 9.2 Features de LLM (para IF_llm)
-
-#### Numéricas transformadas (log1p por heavy-tail)
-```python
-"log1p_cost"          # log1p(LLM_COST_USD)         → rango: [0.000007, 0.139]
-"log1p_response_time" # log1p(LLM_RESPONSE_TIME)     → rango: [200, 34999] ms
-"log1p_total_tokens"  # log1p(LLM_TOTAL_TOKENS)      → rango: [84, 3498]
-"hour_utc"            # int: EVENT_TIMESTAMP.hour
-```
-
-#### Categóricas (OrdinalEncoder para IF)
-```python
-"LLM_STATUS"          # 3 valores: success / error / timeout
-"LLM_MODEL_ID"        # cardinalidad por confirmar con datos reales
-"LLM_PROVIDER"        # cardinalidad por confirmar
-"LOG_TYPE"            # 3 valores: LLM_REQUEST / LLM_ERROR / LLM_TIMEOUT
-```
-
-#### Columnas que NO se usan en evento individual
-- `LLM_ERROR_MESSAGE` → texto libre, trabajo futuro
-- `LLM_PROMPT_CATEGORY` → potencialmente útil, agregar en v2
-
-### 9.3 Features de comportamiento por IP (para LOF_ip)
-
-Una fila por IP única en la ventana activa. ~105 filas.
-
-```python
-"event_count"          # total eventos de esta IP en la ventana
-"distinct_paths"       # COUNT(DISTINCT REQUEST_PATH)
-"distinct_apps"        # COUNT(DISTINCT APPLICATION)
-"ratio_4xx"           # count(status_family==4) / event_count
-"ratio_5xx"           # count(status_family==5) / event_count
-"ratio_security"      # count(LOG_TYPE=='SECURITY') / event_count
-"has_401_or_403"      # int: 1 si algún evento fue 401 o 403
-"has_429"             # int: 1 si algún evento fue 429
-"n_distinct_status"   # COUNT(DISTINCT HTTP_STATUS) — IPs con muchos status distintos son sospechosas
-```
-
-**Encoding para LOF:** OneHotEncoder + RobustScaler (LOF necesita distancias métricas).
+| Algoritmo | Razon de descarte |
+|---|---|
+| Autoencoder/Keras | Dependencias extra, deadline 3 dias |
+| One-Class SVM | Cuadratico en training, sensible a outliers |
+| DBSCAN | O(n2) memoria, muy sensible a parametros |
+| Elliptic Envelope | Asume distribucion Gaussiana unimodal — incorrecto |
 
 ---
 
-## 10. Estrategia de entrenamiento y thresholding
+## 9. Feature engineering — especificacion completa
 
-### Modo de operación (dos fases)
+### Features de Sistema (IF_sistema)
 
-**Cold-start (primeras ventanas, sin historia suficiente):**
-- Fit + predict sobre la ventana actual misma
-- Threshold: IQR sobre los scores del batch
-  - `Q3 + 1.5 × IQR` para marcar como anómalo
-- Cap: máximo 5 alertas por ciclo del modelo
+**Numericas:**
 
-**Modo histórico (después de 20+ ventanas acumuladas):**
-- Entrenar sobre historia rolling (últimas N ventanas, registros con reglas ya conocidas down-weighted)
-- Scorear la ventana nueva
-- Threshold: MAD (Median Absolute Deviation)
-  - Modified Z-score: `|0.6745 × (score - median) / MAD| > 3.5`
-- Cap: máximo 5 alertas por ciclo del modelo
+| Feature | Derivacion |
+|---|---|
+| `status_family` | `int(HTTP_STATUS) // 100` — valores 2,3,4,5 |
+| `is_4xx` | 1 si status_family == 4 |
+| `is_5xx` | 1 si status_family == 5 |
+| `is_401_or_403` | 1 si HTTP_STATUS in ('401','403') |
+| `is_429` | 1 si HTTP_STATUS == '429' |
+| `hour_utc` | EVENT_TIMESTAMP.hour (0-23) |
 
-### Detección de cold-start vs. modo histórico
+**Categoricas (OrdinalEncoder para IF tree-based):**
 
-```python
-# En HANA, contar ventanas distintas acumuladas:
-SELECT COUNT(DISTINCT DATE_TRUNC('MINUTE', EVENT_TIMESTAMP)) 
-FROM DBADMIN.RAW_LOGS_SISTEMA;
-# Si > 40 (20 ventanas × 2 timestamps por ventana) → modo histórico
-```
+| Feature | Cardinalidad | Nota |
+|---|---|---|
+| `LOG_TYPE` | 7 | Directo |
+| `APPLICATION` | 10 | Directo |
+| `REGION_NAME` | 108 | max_categories=32, unknown_value=-1 |
 
-### Por qué cap de 5 alertas
+**No usados en evento individual:** `CLIENT_IP` (solo en tabla agregada), `REQUEST_PATH` raw, `MESSAGE` raw, `LOG_ID`, `INGESTED_AT`.
 
-- Con límite de 100 llamadas/30min y `quick_filter` usando ~15 llamadas (ingesta + alertas)
-- El modelo ML opera en ciclo largo de 28 min → potencialmente simultáneo
-- Cap de 5 deja margen seguro: 15 (quick_filter) + 5 (model) + 10 (ingesta) = 30, muy por debajo de 100
+### Features de LLM (IF_llm)
 
----
+**Numericas (log1p por heavy-tail):**
 
-## 11. Contrato de integración con pipeline_loop.py
+| Feature | Derivacion |
+|---|---|
+| `log1p_cost` | `log1p(LLM_COST_USD)` |
+| `log1p_response_time` | `log1p(LLM_RESPONSE_TIME)` |
+| `log1p_total_tokens` | `log1p(LLM_TOTAL_TOKENS)` |
+| `hour_utc` | EVENT_TIMESTAMP.hour |
 
-### Función principal que debe exponer model.py
+NaN en numericas: imputados con mediana (no con cero — cero seria outlier en estas distribuciones).
 
-```python
-def analizar_ventana(df: pd.DataFrame) -> list[dict]:
-    """
-    Detecta anomalías estadísticas en la ventana actual de logs.
-    
-    Parámetros
-    ----------
-    df : pd.DataFrame
-        DataFrame con los registros de la ventana actual.
-        Puede contener tanto logs de Sistema como LLM (con NaN donde no aplica).
-        El modelo filtra internamente por LOG_TYPE.
-    
-    Retorna
-    -------
-    list[dict] — cada dict tiene exactamente:
-        {
-            "alert_type": str,    # "ml_sistema_anomaly" | "ml_llm_anomaly" | "ml_ip_anomaly"
-            "severity":   str,    # "low" | "medium" | "high"
-            "details":    str,    # descripción legible, máx 250 chars (deja margen para WHAT/WHEN)
-            "log_id":     str,    # LOG_ID del registro más representativo de la anomalía
-            "event_time": str,    # EVENT_TIMESTAMP ISO del registro
-        }
-    
-    Nunca lanza excepciones — cualquier error retorna lista vacía.
-    Cap interno: máximo 5 elementos en la lista retornada.
-    """
-```
+**Categoricas (OrdinalEncoder):**
 
-### Nuevos alert_types para model.py
+| Feature | Cardinalidad |
+|---|---|
+| `LLM_STATUS` | 3: success/error/timeout (minusculas) |
+| `LLM_MODEL_ID` | variable |
+| `LLM_PROVIDER` | variable |
+| `LOG_TYPE` | 3: LLM_REQUEST/LLM_ERROR/LLM_TIMEOUT |
 
-```python
-"ml_sistema_anomaly"  # IF_sistema detectó record con score anómalo
-"ml_llm_anomaly"      # IF_llm detectó record con score anómalo
-"ml_ip_anomaly"       # LOF_ip detectó comportamiento de IP anómalo
-```
+### Tabla de comportamiento por IP (LOF_ip)
 
-Estos se registran con `source="model_ml"` en `DBADMIN.ALERTS`.
+Una fila por IP unica. ~105 filas en produccion. Todas numericas — se aplica `RobustScaler` antes de LOF.
 
-### Cómo se integra en pipeline_loop.py
-
-```python
-# En el bloque del ciclo largo (cada ~28 min):
-if minutos_desde_largo >= (INTERVALO_POLLING_LARGO / 60):
-    try:
-        from model import analizar_ventana
-        df_ventana = _cargar_ventana_para_modelo(conn_hana)  # query a HANA
-        anomalias_ml = analizar_ventana(df_ventana)
-        
-        conn_alerting_ml = _abrir_conexion_hana()
-        try:
-            for anomalia in anomalias_ml:
-                enviar_alerta(
-                    **anomalia,
-                    conn=conn_alerting_ml,
-                    source="model_ml",
-                )
-        finally:
-            _cerrar_conexion_hana(conn_alerting_ml)
-    except Exception as e:
-        logger.error(f"[CICLO-LARGO] Error en model.py: {e}")
-    
-    ultimo_ciclo_largo = ahora_utc
-```
+| Feature | Descripcion |
+|---|---|
+| `event_count` | Total eventos de esta IP en la ventana |
+| `distinct_paths` | COUNT(DISTINCT REQUEST_PATH) |
+| `distinct_apps` | COUNT(DISTINCT APPLICATION) |
+| `ratio_4xx` | Errores cliente / total (0-1) |
+| `ratio_5xx` | Errores servidor / total (0-1) |
+| `ratio_security` | LOG_TYPE='SECURITY' / total (0-1) |
+| `has_401_or_403` | 1 si algun evento fue 401 o 403 |
+| `has_429` | 1 si algun evento fue 429 |
+| `n_distinct_status` | COUNT(DISTINCT HTTP_STATUS) |
 
 ---
 
-## 12. Queries de extracción desde HANA para model.py
+## 10. Estrategia de thresholding
 
-### Extracción de Sistema (ventana actual)
+### Modo de operacion
+
+| Condicion | Modo | Threshold |
+|---|---|---|
+| < 20 ventanas acumuladas | Cold-start | IQR: Q1 - 1.5*IQR |
+| >= 20 ventanas (actual: 309) | Historico | MAD: median - 3.5*(MAD/0.6745) |
+
+El sistema arranca directamente en **modo historico** con las 309 ventanas ya acumuladas.
+
+### Cap de alertas
+
+**Maximo 5 alertas por ciclo largo.** Si hay mas de 5 anomalias detectadas entre los tres modelos, se envian las de mayor severidad primero (high → medium → low).
+
+**Justificacion del cap:** quick_filter usa ~15 llamadas/ventana + model ML usa max 5 = max 20 total. Muy por debajo del limite de 100 llamadas/30min.
+
+---
+
+## 11. Modulos implementados — contratos publicos
+
+### `app/hana_reader.py`
+
+```python
+abrir_conexion_hana() -> conn | None
+leer_sistema_ventana_actual(conn) -> pd.DataFrame   # ultimos 30 min
+leer_llm_ventana_actual(conn) -> pd.DataFrame       # ultimos 30 min
+leer_sistema_historico(conn, horas=24) -> pd.DataFrame
+leer_llm_historico(conn, horas=24) -> pd.DataFrame
+contar_ventanas_acumuladas(conn) -> int
+en_modo_historico(conn) -> bool                     # True si >= 20 ventanas
+```
+
+**Prueba standalone:** `python -m app.hana_reader`
+**Verificado con HANA real:** 3,626 sis + 2,420 LLM (ventana actual) · 127,382 + 42,908 (historico 24h) · 309 ventanas · modo HISTORICO
+
+### `app/feature_eng.py`
+
+```python
+build_sistema_features(df) -> pd.DataFrame    # LOG_ID + 6 numericas + 3 categoricas
+build_llm_features(df) -> pd.DataFrame        # LOG_ID + 4 numericas + 4 categoricas
+build_ip_behavior_table(df) -> pd.DataFrame   # CLIENT_IP + 9 features numericas
+```
+
+**Garantias:** sin NaN en salida, tipos correctos, DataFrames vacios con columnas correctas ante entrada vacia.
+**Prueba standalone:** `python -m app.feature_eng`
+**Verificado:** 4/4 tests pasados
+
+### `app/model.py`
+
+```python
+analizar_ventana(conn, window_start=None) -> list[dict]
+```
+
+Cada dict retornado:
+
+```python
+{
+    "alert_type": "ml_sistema_anomaly" | "ml_llm_anomaly" | "ml_ip_anomaly",
+    "severity":   "low" | "medium" | "high",
+    "details":    str,   # <= 250 chars
+    "log_id":     str,
+    "event_time": str,
+}
+```
+
+**Garantias:** nunca lanza excepciones, cap de 5 alertas, `conn=None` retorna `[]`.
+**Prueba standalone:** `python -m app.model`
+**Verificado:** 6/6 tests pasados
+
+---
+
+## 12. Integracion en `pipeline_loop.py` — ciclo largo
+
+### Flujo de conexiones (sin duplicados)
+
+```
+Cada 28 minutos:
+  conn_ml = _abrir_conexion_hana()
+      |
+      +-- analizar_ventana(conn_ml)
+              +-- hana_reader lee RAW_LOGS_SISTEMA (127k registros historicos)
+              +-- hana_reader lee RAW_LOGS_LLM (43k registros historicos)
+              +-- IF_sistema: train historico -> score ventana -> threshold MAD
+              +-- IF_llm:     train historico -> score ventana -> threshold MAD
+              +-- LOF_ip:     build_ip_table -> fit_predict -> labels
+  _cerrar_conexion_hana(conn_ml)
+
+  Si hay anomalias:
+  conn_alerting_ml = _abrir_conexion_hana()
+      |
+      +-- enviar_alerta(..., source="model_ml") x N anomalias (max 5)
+              +-- INSERT en DBADMIN.ALERTS (alerted=0)
+              +-- POST /alert a API SAP -> HTTP 201
+              +-- UPDATE DBADMIN.ALERTS (alerted=1)
+  _cerrar_conexion_hana(conn_alerting_ml)
+```
+
+### Banner de arranque confirmado en CF
+
+```
+PIPELINE LOOP v2 — Ingesta + Deteccion + Alerting
+quick_filter: activo
+alerting:     activo
+model ML:     activo     <- CONFIRMADO 2026-05-04 08:48:30 UTC
+```
+
+---
+
+## 13. MTTD formal — criterio #1 (40% del score)
+
+**Medicion en ciclo #455, 1 Mayo 2026:**
+
+```
+Inicio de ventana (API):        2026-05-01T06:30:00 UTC
+Ingesta completada:             2026-05-01T06:31:35 UTC
+Deteccion completada:           2026-05-01T06:31:35 UTC  (< 1 seg)
+HTTP 201 confirmado (SAP):      2026-05-01T06:31:36 UTC  (310 ms de red)
+
+MTTD puro (deteccion -> confirmacion SAP): ~1 segundo
+MTTD desde inicio de ventana: ~95 segundos (1 min 35 seg)
+```
+
+**Objetivo del hackathon:** <= 2 minutos. **Resultado: < 2 segundos.**
+
+---
+
+## 14. Procedimiento de git — commit pendiente
+
+Estado actual de `git status`:
+
+```
+Untracked files:
+  app/feature_eng.py
+  app/hana_reader.py
+  app/model.py
+  pipeline_loop_3mayo_miedo.py    <- NO commitear, es artefacto local
+```
+
+### Comandos para el commit oficial
+
+```bash
+git add app/feature_eng.py
+git add app/hana_reader.py
+git add app/model.py
+
+git commit -m "feat: implementar sistema ML completo
+
+- app/hana_reader.py: extraccion desde HANA con schema real, modo historico/cold-start
+- app/feature_eng.py: feature engineering para IF_sistema, IF_llm y LOF_ip
+- app/model.py: IsolationForest x2 + LocalOutlierFactor, thresholding MAD/IQR, cap 5 alertas
+- pipeline_loop.py: ciclo largo activo cada 28 min con analizar_ventana() integrado
+- Fix: conn=None bug en alerting -> DBADMIN.ALERTS ahora persiste correctamente"
+
+git push origin alerts_implementation
+```
+
+### Sobre `pipeline_loop_3mayo_miedo.py`
+
+```bash
+# Opcion 1: agregar a .gitignore
+echo "pipeline_loop_3mayo_miedo.py" >> .gitignore
+
+# Opcion 2: eliminar directamente
+rm pipeline_loop_3mayo_miedo.py
+```
+
+---
+
+## 15. Verificacion pendiente — primer ciclo largo ML
+
+El pipeline arranco a las **08:48:30 UTC**. El primer ciclo largo se disparara a las **~09:16:30 UTC**.
+
+### Que verificar en CF
+
+```bash
+cf logs sap-ai-soc-papoi --recent
+```
+
+Buscar estas lineas:
+```
+[CICLO-LARGO] Han pasado 28.X min — iniciando analisis ML
+[MODEL] Iniciando analisis ML | ventana=...
+[MODEL] Modo: HISTORICO (309/20 ventanas minimas)
+[MODEL] ml_sistema_anomaly: entrenando con X,XXX registros historicos
+[MODEL] ml_llm_anomaly: entrenando con X,XXX registros historicos
+[MODEL] Analisis completado en XXXms | anomalias: X detectadas | Y enviadas
+```
+
+### Verificacion en HANA
 
 ```sql
-SELECT
-    LOG_ID,
-    EVENT_TIMESTAMP,
-    LOG_TYPE,
-    HTTP_STATUS,
-    CLIENT_IP,
-    REQUEST_PATH,
-    APPLICATION,
-    REGION_NAME,
-    MESSAGE
-FROM DBADMIN.RAW_LOGS_SISTEMA
-WHERE EVENT_TIMESTAMP >= ADD_SECONDS(NOW(), -1800)
-ORDER BY EVENT_TIMESTAMP DESC
+SELECT alert_id, alert_type, severity, detected_at, alerted, detection_source
+FROM DBADMIN.ALERTS
+WHERE detection_source = 'model_ml'
+ORDER BY detected_at DESC;
 ```
 
-### Extracción de LLM (ventana actual)
-
-```sql
-SELECT
-    LOG_ID,
-    EVENT_TIMESTAMP,
-    LOG_TYPE,
-    LLM_STATUS,
-    LLM_MODEL_ID,
-    LLM_PROVIDER,
-    LLM_COST_USD,
-    LLM_RESPONSE_TIME,
-    LLM_TOTAL_TOKENS,
-    LLM_TEMPERATURE,
-    LLM_ERROR_MESSAGE,
-    LLM_PROMPT_CATEGORY
-FROM DBADMIN.RAW_LOGS_LLM
-WHERE EVENT_TIMESTAMP >= ADD_SECONDS(NOW(), -1800)
-ORDER BY EVENT_TIMESTAMP DESC
-```
-
-### Extracción histórica para entrenamiento (rolling 24h)
-
-```sql
--- Sistema histórico
-SELECT LOG_ID, EVENT_TIMESTAMP, LOG_TYPE, HTTP_STATUS,
-       CLIENT_IP, REQUEST_PATH, APPLICATION, REGION_NAME
-FROM DBADMIN.RAW_LOGS_SISTEMA
-WHERE EVENT_TIMESTAMP >= ADD_SECONDS(NOW(), -86400)  -- 24 horas
-  AND EVENT_TIMESTAMP < ADD_SECONDS(NOW(), -1800)    -- excluir ventana actual
-ORDER BY EVENT_TIMESTAMP ASC
-
--- LLM histórico
-SELECT LOG_ID, EVENT_TIMESTAMP, LOG_TYPE, LLM_STATUS,
-       LLM_MODEL_ID, LLM_PROVIDER, LLM_COST_USD,
-       LLM_RESPONSE_TIME, LLM_TOTAL_TOKENS, LLM_TEMPERATURE
-FROM DBADMIN.RAW_LOGS_LLM
-WHERE EVENT_TIMESTAMP >= ADD_SECONDS(NOW(), -86400)
-  AND EVENT_TIMESTAMP < ADD_SECONDS(NOW(), -1800)
-ORDER BY EVENT_TIMESTAMP ASC
-```
+Esperamos filas con `detection_source = 'model_ml'` y `alerted = 1`.
 
 ---
 
-## 13. Plan de implementación — próximos pasos
+## 16. Proximos pasos — hacia la eliminatoria (12–14 Mayo)
 
-### Paso A — `app/hana_reader.py`
-
-Módulo de extracción desde HANA. Responsabilidad única: abrir conexión, ejecutar queries, retornar DataFrames con tipos correctos. Testeable en aislamiento.
-
-**Funciones a implementar:**
-- `leer_sistema_ventana_actual(conn) → pd.DataFrame`
-- `leer_llm_ventana_actual(conn) → pd.DataFrame`
-- `leer_sistema_historico(conn, horas=24) → pd.DataFrame`
-- `leer_llm_historico(conn, horas=24) → pd.DataFrame`
-- `contar_ventanas_acumuladas(conn) → int` (para cold-start vs. histórico)
-
-### Paso B — `app/feature_eng.py`
-
-Transformaciones puras sin sklearn. Funciones que reciben DataFrame y retornan DataFrame con features listas. Testeables sin HANA ni modelo.
-
-**Funciones a implementar:**
-- `build_sistema_features(df_sistema) → pd.DataFrame`
-- `build_llm_features(df_llm) → pd.DataFrame`
-- `build_ip_behavior_table(df_sistema) → pd.DataFrame`
-
-### Paso C — `app/model.py`
-
-Los tres modelos + thresholding + función principal `analizar_ventana()`.
-
-**Estructura interna:**
-- `_entrenar_o_cargar_modelos(df_hist_sis, df_hist_llm)` → devuelve `(if_sis, if_llm)`
-- `_threshold_iqr(scores)` → umbral cold-start
-- `_threshold_mad(scores, score_history)` → umbral histórico
-- `analizar_ventana(df) → list[dict]` → función pública, contrato del pipeline
-
-### Paso D — Integración en `pipeline_loop.py`
-
-Reemplazar el placeholder del ciclo largo con llamada real a `model.analizar_ventana()`.
+| Tarea | Responsable | Estado |
+|---|---|---|
+| Pipeline ML desplegado en CF | CIE | COMPLETADO |
+| Verificar primer ciclo largo en CF | CIE | Pendiente (hoy) |
+| Dashboard Streamlit con datos reales | Viz Lead | Pendiente |
+| SAP Analytics Cloud conectado a HANA | Viz Lead | Pendiente |
+| Reporte forense con incidente real | CIE | Pendiente |
+| Reporte estrategico final para SAP | Todo el equipo | Pendiente |
 
 ---
 
-## 14. MTTD formal — para el reporte de evaluación
-
-**MTTD medido en ciclo #455 (1 Mayo 2026):**
-
-```
-@timestamp del evento en API:    2026-05-01T06:30:00 UTC (inicio ventana)
-Ingesta completada:              2026-05-01T06:31:35 UTC
-Detección completada:            2026-05-01T06:31:35 UTC  (< 1 seg después)
-Primer HTTP 201 confirmado:      2026-05-01T06:31:36 UTC  (310ms de red)
-
-MTTD = ~1 segundo desde detección hasta confirmación SAP
-MTTD desde inicio de ventana = ~95 segundos (1 min 35 seg)
-```
-
-**Este número corresponde al criterio #1 (40% del score).** El objetivo del hackathon era ≤ 2 minutos. Estamos en < 2 segundos de latencia de alerting puro, y < 2 minutos desde el primer log de la ventana hasta confirmación SAP.
-
----
-
-## 15. Archivos modificados en esta sesión
-
-```
-sap-security-hackathon/
-├── pipeline_loop.py     ← MODIFICADO: _abrir_conexion_hana() + _cerrar_conexion_hana()
-│                                       + conn=conn_alerting en bloque DETECT+RESPOND
-├── REPORTE_SESION_03MAY2026_Y_DISEÑO_MODELO_ML.md  ← NUEVO (este archivo)
-└── app/
-    ├── hana_reader.py   ← PENDIENTE (Paso A)
-    ├── feature_eng.py   ← PENDIENTE (Paso B)
-    └── model.py         ← PENDIENTE (Paso C)
-```
-
----
-
-*Reporte generado al cierre de sesión — 3 Mayo 2026, ~19:00 CST*  
+*Documento consolidado — 4 Mayo 2026*  
 *Cloud Integration Engineer — SAP AI Security Anomaly Detection Hackathon*

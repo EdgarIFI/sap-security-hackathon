@@ -243,4 +243,4 @@ tests/soc-key.json
 .vscode/
 
 # Ignorando entradas directas para CF
-.cfignore
+# .cfignorepipeline_loop_3mayo_miedo.py
