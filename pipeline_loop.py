@@ -70,6 +70,19 @@ except ImportError as e:
         f"⚠️  alerting no disponible: {e} — amenazas detectadas no se enviarán a SAP"
     )
 
+# model — detección de anomalías ML (ciclo largo cada 28 min)
+# Import condicional: si falla, el pipeline continúa sin ML.
+# La ingesta y quick_filter nunca deben verse afectados por model.py.
+try:
+    from model import analizar_ventana
+    MODEL_DISPONIBLE = True
+    logging.getLogger("pipeline").info("✓ model cargado")
+except ImportError as e:
+    MODEL_DISPONIBLE = False
+    logging.getLogger("pipeline").warning(
+        f"⚠️  model no disponible: {e} — ciclo largo ML desactivado"
+    )
+
 
 # =============================================================================
 # ZONA HORARIA DE MONTERREY
@@ -453,6 +466,7 @@ def main():
     logger.info(f"Ciclo largo (futuro ML): cada {INTERVALO_POLLING_LARGO // 60} minutos")
     logger.info(f"quick_filter: {'✓ activo' if QUICK_FILTER_DISPONIBLE else '✗ no disponible'}")
     logger.info(f"alerting:     {'✓ activo' if ALERTING_DISPONIBLE else '✗ no disponible'}")
+    logger.info(f"model ML:     {'✓ activo' if MODEL_DISPONIBLE else '✗ no disponible'}")
     logger.info(f"Log en: {LOG_FILE}")
     logger.info("Ctrl+C para detener")
     logger.info("=" * 60)
@@ -466,6 +480,7 @@ def main():
 
     numero_ciclo = 0
     ultimo_ciclo_largo = datetime.now(timezone.utc)
+    ventana_inicio_ultimo_ciclo = datetime.now(timezone.utc).isoformat()
 
     # ── Primera ejecución inmediata ───────────────────────────────────────────
     # Captura lo que hay ahora sin esperar el próximo intervalo
@@ -502,23 +517,76 @@ def main():
             time.sleep(SEGUNDOS_REINTENTO)
             ejecutar_ciclo_ingesta(numero_ciclo)
 
-        # ── Verificar si toca ciclo largo (placeholder para model.py) ─────────
-        # Cuando el AI Specialist entregue model.py, este bloque lo invocará
-        # cada vez que hayan pasado ~28 minutos desde el último ciclo largo.
-        # Por ahora solo loguea para confirmar que el timing funciona.
+        # Actualizar ventana para el ciclo largo
+        ventana_inicio_ultimo_ciclo = datetime.now(timezone.utc).isoformat()
+
+        # ── Ciclo largo: detección ML con model.py ────────────────────────────
+        # Se activa cada ~28 minutos. Usa la misma conexión HANA del ciclo
+        # corto para no duplicar conexiones. Si model.py falla, el pipeline
+        # continúa sin interrupciones — la ingesta y quick_filter son prioritarios.
         ahora_utc = datetime.now(timezone.utc)
         minutos_desde_largo = (ahora_utc - ultimo_ciclo_largo).total_seconds() / 60
 
         if minutos_desde_largo >= (INTERVALO_POLLING_LARGO / 60):
-            logger.info(
-                f"[CICLO-LARGO] Han pasado {minutos_desde_largo:.1f} min — "
-                f"placeholder para model.py (AI Specialist)"
-            )
-            # TODO cuando model.py esté listo:
-            # from model import analizar_ventana_completa
-            # anomalias_ml = analizar_ventana_completa()
-            # for anomalia in anomalias_ml:
-            #     enviar_alerta(**anomalia, source="model_ml")
+            if MODEL_DISPONIBLE:
+                logger.info(
+                    f"[CICLO-LARGO] Han pasado {minutos_desde_largo:.1f} min — "
+                    f"iniciando análisis ML"
+                )
+                conn_ml = _abrir_conexion_hana()
+                try:
+                    anomalias_ml = analizar_ventana(
+                        conn=conn_ml,
+                        window_start=ventana_inicio_ultimo_ciclo,
+                    )
+
+                    if anomalias_ml:
+                        logger.warning(
+                            f"[CICLO-LARGO] ⚠️  {len(anomalias_ml)} anomalía(s) ML detectada(s)"
+                        )
+                        conn_alerting_ml = _abrir_conexion_hana()
+                        try:
+                            for anomalia in anomalias_ml:
+                                if ALERTING_DISPONIBLE:
+                                    result = enviar_alerta(
+                                        alert_type   = anomalia["alert_type"],
+                                        severity     = anomalia["severity"],
+                                        details      = anomalia["details"],
+                                        log_id       = anomalia["log_id"],
+                                        event_time   = anomalia.get("event_time"),
+                                        conn         = conn_alerting_ml,
+                                        window_start = ventana_inicio_ultimo_ciclo,
+                                        source       = "model_ml",
+                                    )
+                                    if result.ok:
+                                        logger.info(
+                                            f"[CICLO-LARGO] ✅ Alerta ML enviada | "
+                                            f"type={anomalia['alert_type']} "
+                                            f"({anomalia['severity']}) | "
+                                            f"HTTP {result.status_code}"
+                                        )
+                                    else:
+                                        logger.error(
+                                            f"[CICLO-LARGO] ❌ Alerta ML fallida | "
+                                            f"error={result.error}"
+                                        )
+                        finally:
+                            _cerrar_conexion_hana(conn_alerting_ml)
+                    else:
+                        logger.info("[CICLO-LARGO] ✓ Sin anomalías ML en esta ventana")
+
+                except Exception as e:
+                    logger.error(
+                        f"[CICLO-LARGO] Error en model.py: {e}", exc_info=True
+                    )
+                finally:
+                    _cerrar_conexion_hana(conn_ml)
+            else:
+                logger.info(
+                    f"[CICLO-LARGO] Han pasado {minutos_desde_largo:.1f} min — "
+                    f"model.py no disponible, omitiendo análisis ML"
+                )
+
             ultimo_ciclo_largo = ahora_utc
 
 
