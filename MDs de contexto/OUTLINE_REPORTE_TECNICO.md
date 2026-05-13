@@ -331,335 +331,675 @@ Stores every threat detected by the system, regardless of whether the alert was 
 In parallel to HANA insertion, every ingestion cycle writes a CSV file to `data/raw/logs_[timestamp].csv`. This serves as a permanent local backup of all raw data, independent of HANA availability. Files are named with the UTC timestamp of the ingestion cycle and accumulate over time, one file per cycle.
 
 The backup is not a fallback that replaces HANA — it is an additional layer of data durability. If HANA becomes unavailable for any reason, the raw data exists locally and can be re-ingested when the connection is restored.
-## 5. Pipeline de Datos
 
-### 5.1 La fuente de datos: API SAP
-- Los tres endpoints disponibles y su propósito
-- El comportamiento de ventanas de 30 minutos — datos irrecuperables si se pierden
-- Paginación: 500 registros por página, ~12 páginas por ventana
-- Los dos tipos de logs: Sistema y LLM — columna discriminante `sap_function_log_type`
-- Nulos por diseño — no son errores de calidad
-
-### 5.2 Ingesta y deduplicación
-- El loop de automatización: cálculo exacto de segundos hasta próximo :00 o :30 UTC
-- Primera ejecución inmediata al arrancar el pipeline
-- Deduplicación en dos capas: set Python en memoria + SELECT de IDs en HANA
-- Por qué dos capas: la primera es O(1) y evita queries innecesarias a HANA
-
-### 5.3 ETL y limpieza
-- Eliminación de columnas internas de Elasticsearch (`_score`, `_ignored`, `_index`)
-- Normalización de timestamps a `datetime64 UTC`
-- Normalización de columnas numéricas a `float64`
-- Separación de logs Sistema vs LLM
-
-### 5.4 Persistencia
-- Inserción en HANA con `executemany()` — O(1) en llamadas al servidor
-- Backup en CSV local como fallback — el pipeline continúa si HANA no está disponible
-- Gestión de nulos: conversión de `float('nan')` a `None` para NULL en HANA
-
-### 5.5 Schema de las tablas HANA
-- Tabla `RAW_LOGS_SISTEMA`: columnas clave, tipos, volumen actual
-- Tabla `RAW_LOGS_LLM`: columnas clave, tipos, volumen actual
-- Tabla `ALERTS`: columnas, campo `alerted` (0=pendiente, 1=confirmada por SAP)
 
 ---
 
-## 6. Detección de Amenazas — Quick Filter
+## 5. Threat Detection — Quick Filter
 
-### 6.1 Rol del Quick Filter en el sistema
-- Por qué reglas determinísticas antes que ML: latencia, interpretabilidad, cobertura de casos conocidos
-- Opera sobre `df_nuevos` antes del ETL — no necesita normalización
-- Agrupación por batch: una alerta por tipo y no una por registro — por qué es crítico
+### 5.1 Role of the Quick Filter in the System
 
-### 6.2 Las 6 reglas implementadas
-Para cada regla: qué detecta, en qué tipo de log, la lógica exacta, y la severidad asignada.
+The Quick Filter is the first detection layer in the pipeline. It executes every 2 minutes as part of the short cycle, analysing each batch of newly ingested records before any ML processing occurs. Its purpose is to detect known attack patterns with zero latency and full interpretability.
 
-- **Regla 1 — Security Event:** `log_type == 'SECURITY'` · severidad HIGH/MEDIUM por conteo de IPs
-- **Regla 2 — Brute Force:** ≥5 errores HTTP 401/403 desde la misma IP en un ciclo · HIGH
-- **Regla 3 — Path Scan:** ≥3 peticiones 404 a rutas sospechosas desde la misma IP · MEDIUM/HIGH
-- **Regla 4 — High Cost LLM Error:** `LLM_ERROR` con `llm_cost_usd > 1.0` · HIGH/MEDIUM
-- **Regla 5 — LLM Timeout:** cualquier `LLM_TIMEOUT` · HIGH/MEDIUM por conteo
-- **Regla 6 — Slow LLM Response:** `llm_response_time_ms > 10,000` · MEDIUM/LOW
+Three design decisions define the Quick Filter's role:
 
-### 6.3 Clasificación según taxonomía de seguridad
-- Mapeo de reglas a familias Tenable/Nessus: Brute Force Attacks, CGI Abuses, Web Servers, Artificial Intelligence
+**Speed over depth.** The Quick Filter operates on `df_nuevos` — the raw records just returned by the API — before any ETL transformation. Its rules are simple field comparisons and counting operations that execute in milliseconds. This is what achieves the system's MTTD of approximately 1 second: the moment new records arrive, the Quick Filter scans them immediately.
 
-### 6.4 Resultados en producción
-- Tipos de amenazas más frecuentes detectadas
-- Distribución de severidades
+**Deterministic and interpretable.** Every rule has explicit, auditable logic. When the Quick Filter reports a brute force attack, the alert message states exactly how many authentication failures occurred, from which IP, and within what time window. There is no statistical ambiguity — the rule either fires or it does not.
+
+**Batch aggregation to prevent alert flooding.** In production, a single 30-minute window can contain hundreds of slow LLM responses or dozens of SECURITY events. Without aggregation, the system would send hundreds of individual alerts to SAP, saturating their dashboard. The Quick Filter groups related events into a single alert per type per batch, including a summary count and the most relevant details.
+
+### 5.2 The Six Detection Rules
+
+Each rule targets a specific threat category. Rules are applied sequentially to every batch of new records. A single batch can trigger multiple rules simultaneously.
+
+#### Rule 1 — Security Event Detection
+
+| Attribute | Value |
+|---|---|
+| **Target log type** | System |
+| **Condition** | `LOG_TYPE == 'SECURITY'` |
+| **Aggregation** | One alert per batch with count of events and list of involved IPs |
+| **Severity** | HIGH if ≥ 3 events in the batch, MEDIUM if 1–2 |
+
+SECURITY events are explicitly flagged by the SAP platform as security-relevant. They represent authentication anomalies, access control violations, or other events that the SAP runtime itself considers significant. The Quick Filter treats every SECURITY event as actionable.
+
+#### Rule 2 — Brute Force Detection
+
+| Attribute | Value |
+|---|---|
+| **Target log type** | System |
+| **Condition** | ≥ 5 HTTP 401 or 403 responses from the same `CLIENT_IP` in a single batch |
+| **Aggregation** | One alert per offending IP |
+| **Severity** | HIGH |
+
+A concentrated burst of authentication failures from a single IP is the classic signature of a credential brute force attack. The threshold of 5 failures per batch was calibrated empirically: in production data, legitimate users rarely exceed 2–3 failed attempts within a 2-minute polling cycle. The rule counts both HTTP 401 (Unauthorized) and HTTP 403 (Forbidden) because attackers may encounter either response depending on the authentication mechanism.
+
+#### Rule 3 — Path Scanning Detection
+
+| Attribute | Value |
+|---|---|
+| **Target log type** | System |
+| **Condition** | ≥ 3 HTTP 404 responses to suspicious paths from the same `CLIENT_IP` |
+| **Suspicious paths** | `/phpmyadmin`, `/.env`, `/cgi-bin`, `/admin`, `/wp-admin`, `/wp-login`, and similar well-known attack surface paths |
+| **Aggregation** | One alert per offending IP |
+| **Severity** | HIGH if critical paths (`.env`, `cgi-bin`), MEDIUM otherwise |
+
+Path scanning is a reconnaissance technique where an attacker probes an application for known vulnerable endpoints. The combination of 404 responses and suspicious path patterns distinguishes scanning from legitimate users who may occasionally request non-existent pages. The path list is based on OWASP Top 10 commonly targeted endpoints.
+
+#### Rule 4 — High-Cost LLM Error
+
+| Attribute | Value |
+|---|---|
+| **Target log type** | LLM |
+| **Condition** | `LOG_TYPE == 'LLM_ERROR'` AND `LLM_COST_USD > 1.0` |
+| **Aggregation** | One alert per batch with total cost and maximum individual cost |
+| **Severity** | HIGH if ≥ 3 events, MEDIUM if 1–2 |
+
+An LLM request that fails but still incurs a cost above 1.0 USD is operationally significant. In production SAP environments, this could indicate prompt injection attacks that generate expensive completions before failing, misconfigured AI services consuming budget without producing results, or denial-of-wallet attacks targeting the AI cost layer.
+
+#### Rule 5 — LLM Timeout
+
+| Attribute | Value |
+|---|---|
+| **Target log type** | LLM |
+| **Condition** | `LOG_TYPE == 'LLM_TIMEOUT'` |
+| **Aggregation** | One alert per batch with count and affected model |
+| **Severity** | HIGH if ≥ 3 timeouts, MEDIUM otherwise |
+
+LLM timeouts indicate that an AI model did not respond within the expected time window. A burst of timeouts in a single batch may signal model overload, infrastructure degradation, or an attacker deliberately triggering expensive long-running prompts.
+
+#### Rule 6 — Slow LLM Response
+
+| Attribute | Value |
+|---|---|
+| **Target log type** | LLM |
+| **Condition** | `LLM_RESPONSE_TIME > 10,000` ms |
+| **Aggregation** | One alert per batch with count, maximum response time, and average |
+| **Severity** | MEDIUM if ≥ 10 slow responses, LOW otherwise |
+
+Response times exceeding 10 seconds are significantly above the observed average of approximately 8,780 ms. While individual slow responses may be normal, a concentration of slow responses in a single batch suggests systemic performance degradation that warrants investigation.
+
+### 5.3 Security Taxonomy Mapping
+
+Each rule maps to a recognised security threat family:
+
+| Rule | Threat Family | Reference Framework |
+|---|---|---|
+| Security Event | Access Control Violations | NIST SP 800-53 AC family |
+| Brute Force | Credential Attacks | MITRE ATT&CK T1110 |
+| Path Scan | Reconnaissance / Directory Traversal | OWASP Top 10 A01:2021 |
+| High-Cost LLM Error | AI Cost Manipulation | OWASP LLM Top 10 LLM04 |
+| LLM Timeout | AI Service Degradation | OWASP LLM Top 10 LLM05 |
+| Slow LLM Response | Performance Anomaly | — |
+
+### 5.4 Production Results
+
+In production since May 1, 2026, the Quick Filter has consistently detected three primary threat categories per 30-minute window:
+
+| Alert Type | Typical Count per Window | Typical Severity |
+|---|---|---|
+| `security_event` | 85–112 SECURITY events | HIGH |
+| `llm_timeout` | 78–264 LLM_TIMEOUT events | HIGH |
+| `slow_llm_response` | 255–795 slow responses | MEDIUM |
+| `brute_force` | 0–2 IPs per window | HIGH |
+| `path_scan` | Rare | MEDIUM–HIGH |
+| `high_cost_llm_error` | Not observed (max cost = 0.139 USD) | — |
+
+Rule 4 (High-Cost LLM Error) has not triggered in production because the maximum observed `LLM_COST_USD` is 0.139 USD — well below the 1.0 USD threshold. The rule remains active as a safeguard against future cost anomalies.
 
 ---
 
-## 7. Detección de Anomalías — Modelo de Machine Learning
+## 6. Anomaly Detection — Machine Learning Model
 
-### 7.1 Justificación del enfoque no supervisado
-- Por qué no supervisado: ausencia de etiquetas, naturaleza desconocida de los ataques
-- Alternativas consideradas y por qué se descartaron
-- El principio: aprender lo normal y detectar desviaciones
+### 6.1 Justification for Unsupervised Learning
 
-### 7.2 Los tres modelos
+The ML model addresses a fundamental limitation of rule-based detection: rules can only detect threats that match predefined patterns. An attacker using a technique not covered by any of the six Quick Filter rules would pass through the deterministic layer undetected.
 
-#### Isolation Forest — Logs de Sistema
-- Propósito: detectar eventos individuales anómalos en actividad web
-- Features utilizadas (9): `status_family`, `is_4xx`, `is_5xx`, `is_401_or_403`, `is_429`, `hour_utc`, `LOG_TYPE`, `APPLICATION`, `REGION_NAME`
-- Hiperparámetros: `n_estimators=200`, `max_samples=256`, `contamination='auto'`, `random_state=42`
-- Complejidad: O(t × n × log n)
+Unsupervised learning solves this by inverting the detection paradigm. Instead of defining what an attack looks like, the model learns what normal behaviour looks like and flags everything that deviates significantly from that learned baseline. This approach requires no labeled examples and can detect novel attack patterns that were never anticipated during system design.
 
-#### Isolation Forest — Logs de LLM
-- Propósito: detectar peticiones LLM anómalas en costo, tiempo o tokens
-- Features utilizadas: `log1p(LLM_COST_USD)`, `log1p(LLM_RESPONSE_TIME)`, `log1p(LLM_TOTAL_TOKENS)`, `LLM_STATUS`, `LLM_PROVIDER`, `LLM_MODEL_ID`
-- Por qué `log1p`: distribución heavy-tail de las métricas LLM
-- Hiperparámetros: mismos que IF Sistema
+**Alternatives considered and rejected:**
 
-#### Local Outlier Factor — Comportamiento por IP
-- Propósito: detectar IPs con comportamiento agregado anómalo (no eventos individuales)
-- Por qué LOF y no IF para este caso: LOF compara densidades locales, captura comportamiento relativo entre IPs
-- Features: métricas agregadas por IP — conteo de peticiones, diversidad de rutas, tasa de errores, distribución de códigos HTTP
-- Hiperparámetros: `n_neighbors=20`, `contamination='auto'`
-- `RobustScaler` previo al LOF: por qué — LOF calcula distancias euclidianas, features en rangos muy distintos
+| Algorithm | Reason for Rejection |
+|---|---|
+| Supervised classifiers (Random Forest, XGBoost) | No labeled attack history exists. Cannot train without ground truth. |
+| Autoencoder (Keras/TensorFlow) | Additional dependencies, more hyperparameters, reconstruction threshold less interpretable than IF scores. Rejected due to 3-day implementation deadline. |
+| One-Class SVM | Training complexity is quadratic in sample count — impractical for 127,000+ training records per cycle. Sensitive to outliers in training data. |
+| DBSCAN | Memory complexity is O(n²) and the algorithm is extremely sensitive to the epsilon parameter. Not suitable for high-dimensional mixed-type data. |
+| Elliptic Envelope | Assumes unimodal Gaussian distribution — incorrect for HTTP status codes, log types, and heavy-tailed LLM metrics. |
 
-### 7.3 Feature Engineering
-- `OrdinalEncoder` para variables categóricas
-- Flags booleanos para códigos HTTP críticos
-- `log1p()` para métricas con distribución heavy-tail
-- `RobustScaler` para LOF
+### 6.2 The Three Models
 
-### 7.4 Thresholding con MAD
-- Por qué MAD y no desviación estándar: robustez ante outliers
-- Fórmula: `threshold = median - 3.5 × (MAD / 0.6745)`
-- Modo histórico (≥20 ventanas): usa percentil acumulado
-- Cap de 5 alertas por ciclo ML ordenadas por severidad
+The system deploys three models that operate in parallel during each 28-minute ML cycle. Each model analyses a different population of data and answers a different detection question.
 
-### 7.5 Resultados en producción
-- Primera ejecución (4 mayo 2026): volumen de datos, anomalías detectadas, tiempo de ejecución
-- Ejemplos de anomalías detectadas
+#### Isolation Forest — System Logs (`IF_sistema`)
+
+**Purpose:** Detect individual system log events that are statistically unusual compared to the historical baseline of system activity.
+
+**How Isolation Forest works:** The algorithm constructs an ensemble of 200 random decision trees. Each tree selects a random subsample of 256 records and recursively partitions the feature space by choosing random features and random split points. An anomalous point — one that sits far from the dense regions of normal data — requires fewer partitions to be isolated. The anomaly score is inversely proportional to the average isolation depth across all 200 trees.
+
+**Features used (9 dimensions):**
+
+| Feature | Derivation | Type |
+|---|---|---|
+| `status_family` | `int(HTTP_STATUS) // 100` → values 2, 3, 4, 5 | Numeric |
+| `is_4xx` | 1 if client error family | Binary |
+| `is_5xx` | 1 if server error family | Binary |
+| `is_401_or_403` | 1 if authentication failure | Binary |
+| `is_429` | 1 if rate limited | Binary |
+| `hour_utc` | Hour extracted from EVENT_TIMESTAMP (0–23) | Numeric |
+| `LOG_TYPE` | OrdinalEncoder → integer (7 categories) | Encoded categorical |
+| `APPLICATION` | OrdinalEncoder → integer (10 categories) | Encoded categorical |
+| `REGION_NAME` | OrdinalEncoder → integer (max 32 categories) | Encoded categorical |
+
+**Why OrdinalEncoder for categorical features:** Isolation Forest uses tree-based splits internally. Trees operate on numerical thresholds — they can split directly on ordinal integers without requiring one-hot expansion. OneHotEncoder would expand `REGION_NAME` from 1 column to 108 binary columns, increasing dimensionality without improving split quality for a tree-based algorithm.
+
+**Hyperparameters:**
+
+```python
+IsolationForest(
+    n_estimators=200,     # ensemble size — 200 trees provide stable score estimates
+    max_samples=256,      # subsample per tree — optimal value from the original IF paper (Liu et al., 2008)
+    contamination="auto", # let sklearn estimate anomaly fraction from scores
+    random_state=42,      # reproducibility
+    n_jobs=-1             # use all available CPU cores in Cloud Foundry
+)
+```
+
+**Computational complexity:** O(t × ψ × log ψ) where t = 200 trees and ψ = 256 subsample size. This means training time is independent of the total dataset size — whether there are 10,000 or 1,000,000 records, each tree trains on exactly 256 samples. In production, the full training + scoring cycle completes in approximately 6 seconds over 127,000 historical records.
+
+#### Isolation Forest — LLM Logs (`IF_llm`)
+
+**Purpose:** Detect individual LLM log events with unusual combinations of cost, response time, token count, and model behaviour.
+
+**Features used (8 dimensions):**
+
+| Feature | Derivation | Type |
+|---|---|---|
+| `log1p_cost` | `log1p(LLM_COST_USD)` | Numeric (transformed) |
+| `log1p_response_time` | `log1p(LLM_RESPONSE_TIME)` | Numeric (transformed) |
+| `log1p_total_tokens` | `log1p(LLM_TOTAL_TOKENS)` | Numeric (transformed) |
+| `hour_utc` | Hour extracted from EVENT_TIMESTAMP | Numeric |
+| `LLM_STATUS` | OrdinalEncoder (3 values: success, error, timeout) | Encoded categorical |
+| `LLM_MODEL_ID` | OrdinalEncoder (variable cardinality) | Encoded categorical |
+| `LLM_PROVIDER` | OrdinalEncoder (variable cardinality) | Encoded categorical |
+| `LOG_TYPE` | OrdinalEncoder (3 values) | Encoded categorical |
+
+**Why `log1p` transformation:** The three numerical LLM metrics have heavy-tailed distributions where extreme values are orders of magnitude larger than typical values:
+
+| Metric | Min | Max | Ratio |
+|---|---|---|---|
+| `LLM_COST_USD` | 0.000007 | 0.139 | 19,857× |
+| `LLM_RESPONSE_TIME` | 200 ms | 34,999 ms | 174× |
+| `LLM_TOTAL_TOKENS` | 84 | 3,498 | 41× |
+
+Without transformation, the extreme values would dominate the isolation tree splits, making it difficult to distinguish moderately anomalous values from truly extreme ones. `log1p(x) = log(1 + x)` compresses the range monotonically: `log1p(34,999) = 10.46`, making the full range manageable for tree splits while preserving the relative ordering of all values.
+
+**Hyperparameters:** Identical to IF_sistema.
+
+#### Local Outlier Factor — IP Behaviour (`LOF_ip`)
+
+**Purpose:** Detect IP addresses whose aggregate behaviour pattern is unusual compared to other IPs active in the same time window.
+
+**Why LOF instead of Isolation Forest for this task:** Isolation Forest detects global anomalies — points that are far from the overall data centre. LOF detects local anomalies — points that are in unusually sparse regions relative to their nearest neighbours. For IP behaviour analysis, the relevant question is not whether an IP is globally extreme, but whether its combination of activity metrics is unusual compared to similar IPs. An IP with 500 requests may be perfectly normal if other high-volume IPs show similar patterns. LOF captures this relative comparison.
+
+**How LOF works:** For each IP, the algorithm identifies its 20 nearest neighbours in feature space and computes the local reachability density — a measure of how tightly packed the IP's neighbourhood is. The LOF score is the ratio of the average density of an IP's neighbours to the IP's own density. An IP in a region much sparser than its neighbours receives a high LOF score, indicating anomalous behaviour.
+
+**Features used (9 dimensions) — one row per unique IP:**
+
+| Feature | Description |
+|---|---|
+| `event_count` | Total events generated by this IP in the window |
+| `distinct_paths` | Number of unique URL paths accessed |
+| `distinct_apps` | Number of unique applications accessed |
+| `ratio_4xx` | Fraction of requests that returned client errors (0.0–1.0) |
+| `ratio_5xx` | Fraction of requests that returned server errors (0.0–1.0) |
+| `ratio_security` | Fraction of events flagged as SECURITY type (0.0–1.0) |
+| `has_401_or_403` | 1 if any request was an authentication failure |
+| `has_429` | 1 if any request was rate-limited |
+| `n_distinct_status` | Count of distinct HTTP status codes — IPs performing reconnaissance exhibit high status diversity |
+
+**Preprocessing — RobustScaler:** LOF computes Euclidean distances between points. If `event_count` ranges from 1 to 1,000 and `ratio_4xx` ranges from 0.0 to 1.0, the distance metric would be completely dominated by `event_count`. RobustScaler normalises each feature by subtracting the median and dividing by the interquartile range. It is robust to outliers because it uses median and IQR instead of mean and standard deviation, which are distorted by extreme values.
+
+**Hyperparameters:**
+
+```python
+LocalOutlierFactor(
+    n_neighbors=20,       # safe with ~105 unique IPs per window
+    contamination="auto", # let sklearn estimate outlier fraction
+    novelty=False         # fit_predict on the current window, not novelty detection
+)
+```
+
+**Scale:** With approximately 105 unique IPs per window, the feature matrix has 105 rows × 9 columns. LOF computation is trivially fast at this scale.
+
+### 6.3 Feature Engineering Pipeline
+
+The feature engineering module (`app/feature_eng.py`) transforms raw DataFrames from HANA into numerical feature matrices. It is a pure Python/pandas module with no sklearn or HANA dependencies, making it fully testable in isolation.
+
+**Design guarantees:**
+- No NaN values in output — all missing values are imputed before returning
+- Categorical NaN values are filled with the string `"UNKNOWN"`
+- Numerical NaN values in LLM metrics are imputed with the column median (not zero — zero would be an outlier in these distributions)
+- `HTTP_STATUS` is stored as NVARCHAR in HANA and is cast to integer during feature construction, with unparseable values defaulting to 200
+
+**The three builder functions:**
+
+| Function | Input | Output | Row count |
+|---|---|---|---|
+| `build_sistema_features(df)` | Raw system logs from HANA | `LOG_ID` + 9 feature columns | Same as input (~3,500/window) |
+| `build_llm_features(df)` | Raw LLM logs from HANA | `LOG_ID` + 8 feature columns | Same as input (~2,400/window) |
+| `build_ip_behavior_table(df)` | Raw system logs from HANA | `CLIENT_IP` + 9 feature columns | One row per unique IP (~105) |
+
+### 6.4 Thresholding Strategy
+
+Isolation Forest's `decision_function()` returns a continuous score for each record where more negative values indicate higher anomaly likelihood. Converting these scores into binary anomaly labels requires a threshold. The system uses two strategies depending on the amount of accumulated data.
+
+#### Historical Mode (≥ 20 accumulated windows — current state: 309 windows)
+
+The model trains on the most recent 24 hours of historical data (excluding the current window to prevent data leakage) and scores only the current window. The threshold is computed using the Median Absolute Deviation (MAD):
+
+```
+threshold = median(scores) - 3.5 × (MAD / 0.6745)
+```
+
+where `MAD = median(|score_i - median(scores)|)`.
+
+**Why MAD instead of mean and standard deviation:** The mean and standard deviation are sensitive to the very outliers the system is trying to detect. If 5 scores are extremely negative, they pull the mean downward and inflate the standard deviation, making the threshold less reliable. MAD uses the median, which is unaffected by extreme values. The constant 0.6745 calibrates MAD to be comparable to standard deviation under a normal distribution. The factor 3.5 sets the sensitivity — equivalent to approximately 3.5 robust standard deviations from the median, which is conservative and minimises false positives.
+
+#### Cold-Start Mode (< 20 accumulated windows)
+
+When the system has insufficient historical data, it trains and scores on the same current window. The threshold is computed using the Interquartile Range:
+
+```
+threshold = Q1 - 1.5 × IQR
+```
+
+where `Q1` is the 25th percentile and `IQR = Q3 - Q1`. This is the standard statistical criterion for identifying lower outliers in a boxplot. It is less precise than MAD because it operates on the same data used for training, but it provides a reasonable baseline until enough history accumulates.
+
+**Transition:** The system automatically switches from cold-start to historical mode when `contar_ventanas_acumuladas()` returns 20 or more. With 309 windows already accumulated, the current system operates exclusively in historical mode.
+
+#### Alert Cap
+
+The model generates a maximum of 5 alerts per ML cycle, regardless of how many anomalies are detected. Alerts are sorted by severity (HIGH → MEDIUM → LOW) and only the top 5 are dispatched.
+
+**Rationale:** The API limit of 100 calls per 30 minutes must be shared between ingestion (~10 calls), Quick Filter alerts (~5 calls), and ML alerts. A cap of 5 keeps the total well below the limit while ensuring the most critical anomalies are always reported.
+
+### 6.5 Adaptation and Evolution
+
+The model does not persist trained state between cycles. Each 28-minute ML cycle trains fresh on the most recent 24 hours of data from HANA.
+
+This design means the model adapts implicitly as the data evolves. Every 30 minutes, approximately 5,500 new records enter HANA. When the next ML cycle runs, those records are part of the training set. If the SAP environment gradually changes its behaviour — a new application is deployed, traffic patterns shift, or a model provider changes response characteristics — the model's learned baseline absorbs those changes within 24 hours.
+
+The trade-off is that sudden, dramatic changes in data distribution can cause a transient period of elevated false positives. If the baseline shifts overnight, the model will spend the next 24 hours recalibrating as the old data rolls out of the training window. This is an accepted limitation for a hackathon system; a production deployment would add drift detection and dynamic threshold adjustment to handle abrupt shifts.
+
+### 6.6 Production Results
+
+**First ML cycle in production — May 4, 2026, 09:16:42 UTC:**
+
+| Metric | Value |
+|---|---|
+| Training set (system) | 127,382 records (24h history) |
+| Training set (LLM) | 42,908 records (24h history) |
+| Scoring set (current window) | ~3,600 system + ~2,400 LLM |
+| Unique IPs analysed | ~105 |
+| Mode | Historical (309 windows accumulated) |
+| Execution time | ~6 seconds |
+| IF_sistema anomalies | 0 (threshold not exceeded) |
+| IF_llm anomalies | 0 (threshold not exceeded) |
+| LOF_ip anomalies | 5 IPs with anomalous behaviour |
+| Alerts dispatched | 5 (1 HIGH, 2 MEDIUM, 2 LOW) |
+| All alerts confirmed by SAP | HTTP 201 × 5 |
+| All alerts persisted in HANA | `alerted=1` × 5, `detection_source='model_ml'` |
+
+The fact that all 5 anomalies were detected by LOF (IP behaviour) rather than IF (individual events) is consistent with the system's design: the Quick Filter already captures individually extreme events through deterministic rules. The ML model's primary value lies in detecting aggregate behavioural patterns — combinations of activity that no single rule would flag but that are statistically unusual when compared to the behaviour of peer IPs in the same time window.
 
 ---
 
-## 8. Sistema de Alerting
+## 7. Alerting System
 
-### 8.1 El endpoint de alertas
-- `POST /alert` en la misma API SAP — mismo `BEARER_TOKEN`
-- Formato del mensaje: `WHAT: ... WHEN: ... WHY: ...` · máximo 300 caracteres
-- Respuesta exitosa: HTTP 201 (no 200)
+### 7.1 The Alert Endpoint
 
-### 8.2 Garantías del sistema
-- Anti-duplicados: verificación por `log_id` antes de cada envío
-- Retry con backoff exponencial: 1s → 2s, máximo 3 intentos ante 5xx o timeout
-- `enviar_alerta()` nunca lanza excepciones — errores quedan en `AlertResult.error`
-- Registro en `DBADMIN.ALERTS`: `alerted=0` al detectar, `alerted=1` al confirmar HTTP 201
+Alerts are dispatched via `POST /alert` on the same SAP API that serves the log data. This is not an external webhook — it uses the same base URL and the same Bearer token as the ingestion endpoints. This was a critical discovery during implementation: the original system design assumed a separate webhook URL would be provided, but the actual API exposes alerting as a native endpoint.
 
-### 8.3 Métricas de alerting
-- Latencia de confirmación: 188–310 ms (detección → HTTP 201 de SAP)
-- Tasa de alertas confirmadas vs fallidas
-- Source de cada alerta: `quick_filter` o `model_ml`
+**Request format:**
+
+```json
+{
+    "message": "WHAT: Brute force detected WHEN: 2026-05-04T09:15:33Z WHY: 7 auth failures from IP 131.127.24.194 in 2 min"
+}
+```
+
+The message field accepts a single string of up to 300 characters formatted with WHAT/WHEN/WHY structure. This format was defined by the SAP API specification and is designed to provide actionable context to the SAP security team in a single glance.
+
+**Successful response:** HTTP 201 Created — not 200. The system explicitly checks for status code 201 to confirm that SAP has acknowledged and registered the alert.
+
+### 7.2 System Guarantees
+
+The alerting module (`app/alerting.py`) implements four guarantees that ensure reliability without compromising pipeline stability:
+
+**1. Never raises exceptions.** The function `enviar_alerta()` wraps all operations in try/except and returns an `AlertResult` dataclass containing `success: bool`, `status_code: int`, and `error: str`. If the POST fails for any reason, the error is captured in the result object and the pipeline continues. The ingestion loop must never stop because of an alerting failure.
+
+**2. Anti-duplicate enforcement.** Before sending any alert, the system checks whether an alert with the same `log_id` has already been sent. This prevents duplicate alerts when the pipeline polls the same window multiple times within a 30-minute period. The deduplication operates via an in-memory set of already-alerted IDs.
+
+**3. Retry with exponential backoff.** If the POST receives a 5xx server error or times out, the system retries up to 3 times with exponential delays: 1 second, then 2 seconds. Permanent failures (4xx responses) are not retried.
+
+**4. Dual-state persistence in HANA.** Each alert follows a two-step process:
+- **Step 1:** INSERT into `DBADMIN.ALERTS` with `alerted = 0` (detected, POST pending)
+- **Step 2:** If the POST returns HTTP 201, UPDATE the same row to `alerted = 1` (confirmed by SAP)
+
+This distinction is critical for forensic reporting: `alerted = 0` indicates a detection that the system failed to communicate to SAP (network error, API downtime), while `alerted = 1` indicates a confirmed, acknowledged alert. As of May 10, 2026, all 1,537 alerts have `alerted = 1` — a 100% confirmation rate.
+
+### 7.3 Alerting Metrics
+
+| Metric | Value |
+|---|---|
+| Alert latency (detection → HTTP 201 confirmation) | 188–310 ms |
+| Average POST time | ~200 ms |
+| Retry rate | < 1% of alerts require retry |
+| Confirmation rate | 100% (all alerted = 1) |
+| Alerts from Quick Filter | ~3–5 per window (security events, timeouts, slow responses) |
+| Alerts from ML model | ≤ 5 per ML cycle (cap enforced) |
+| Sources tracked | `quick_filter` and `model_ml` in `DETECTION_SOURCE` column |
+
+### 7.4 Connection Lifecycle
+
+The alerting system uses dedicated HANA connections that are separate from the connections used for data ingestion and ML model training. This separation ensures that a long-running ML training operation does not block alert persistence, and that an alerting failure does not corrupt an active ingestion transaction.
+
+```
+Short cycle (every 2 min):
+    conn_alerting = _abrir_conexion_hana()    # dedicated connection
+    try:
+        for each threat from quick_filter:
+            enviar_alerta(..., conn=conn_alerting, source="quick_filter")
+    finally:
+        _cerrar_conexion_hana(conn_alerting)   # always closed
+
+Long cycle (every 28 min):
+    conn_ml = _abrir_conexion_hana()           # dedicated for ML reading
+    try:
+        anomalies = analizar_ventana(conn=conn_ml)
+    finally:
+        _cerrar_conexion_hana(conn_ml)
+
+    conn_alerting_ml = _abrir_conexion_hana()  # dedicated for ML alerting
+    try:
+        for each anomaly:
+            enviar_alerta(..., conn=conn_alerting_ml, source="model_ml")
+    finally:
+        _cerrar_conexion_hana(conn_alerting_ml)
+```
+
+Each connection is opened immediately before use and closed in a `finally` block, guaranteeing cleanup regardless of success or failure.
 
 ---
 
-## 9. Visualización — SAP Analytics Cloud
+## 8. Visualización — SAP Analytics Cloud
 
-### 9.1 Arquitectura de la conexión SAC–HANA
+### 8.1 Arquitectura de la conexión SAC–HANA
 - HDI Container `Prod_Vizz`: qué es y por qué se necesita para la Live Connection
 - Synonyms: puente entre el schema DBADMIN y el HDI Container
 - Calculation Views: tipo CUBE, measures y attributes expuestos a SAC
 
-### 9.2 Estado actual de los Calculation Views
+### 8.2 Estado actual de los Calculation Views
 - `CV_LOGS_LLM` ✅ — operativo: measures (tokens, costo, tiempo de respuesta), attributes (proveedor, modelo, región, status)
 - `CV_LOGS_SISTEMA` ⏳ — en progreso
 - `CV_ALERTS` ⏳ — en progreso
 
-### 9.3 Usuarios y acceso a SAC
+### 8.3 Usuarios y acceso a SAC
 - `SAC_USER`: permisos SELECT + roles HDI `access_role` y `external_privileges_role`
 - Separación de usuarios: SAC_USER ≠ PIPELINE_USER ≠ DBADMIN
 
-### 9.4 Dashboard del SOC
+### 8.4 Dashboard del SOC
 - Métricas y visualizaciones planeadas
 - Screenshots del dashboard actual *(insertar evidencia)*
 
 ---
 
-## 10. MLOps y Despliegue en Cloud Foundry
+## 9. MLOps y Despliegue en Cloud Foundry
 
-### 10.1 Configuración del despliegue
+### 9.1 Configuración del despliegue
 - `manifest.yml`: comando de inicio, `health-check-type: process`, memoria, instancias
 - `requirements.txt`: dependencias del entorno de producción
 - `runtime.txt`: versión de Python
 
-### 10.2 Gestión de credenciales por entorno
+### 9.2 Gestión de credenciales por entorno
 - Local: `.env` → `os.getenv()` → DBADMIN
 - Producción (CF): `cf set-env` → User-Provided variables → PIPELINE_USER
 - La función `_load_hana_creds()`: prioridad 1) variables directas, 2) VCAP_SERVICES, 3) falla controlada
 - VCAP_SERVICES: hana y xsuaa bound — no consumidos activamente por el código
 
-### 10.3 Monitoreo y observabilidad
+### 9.3 Monitoreo y observabilidad
 - Logging dual: consola (tiempo real) + `pipeline.log` (historial persistente)
 - Cada mensaje incluye hora UTC y hora Monterrey (CDT = UTC-6)
 - `cf logs sap-ai-soc-papoi --recent` para diagnóstico
 
-### 10.4 Manejo de errores en el loop
+### 9.4 Manejo de errores en el loop
 - HTTP 401 → `sys.exit(1)` — fatal, no sirve reintentar
 - HTTP 5xx / Timeout → esperar 60s + reintentar
 - HANA no disponible → continuar solo con CSV
 - `KeyboardInterrupt` → cierre limpio con reporte de ciclos completados
 
-### 10.5 Diagrama del Pipeline Loop
+### 9.5 Diagrama del Pipeline Loop
 - *(insertar Slide 3 del PowerPoint)*
 
 ---
 
-## 11. Seguridad y Gestión de Credenciales
+## 10. Seguridad y Gestión de Credenciales
 
-### 11.1 Separación de usuarios por principio de mínimo privilegio
+### 10.1 Separación de usuarios por principio de mínimo privilegio
 - `DBADMIN`: acceso total — solo para administración y setup
 - `PIPELINE_USER`: SELECT + INSERT + UPDATE sobre las 3 tablas — solo lo necesario para el pipeline
 - `SAC_USER`: SELECT + roles HDI — solo lectura para dashboards
 - `#OO / #DI`: usuarios técnicos del HDI Container — gestionados por SAP
 
-### 11.2 Gestión de credenciales
+### 10.2 Gestión de credenciales
 - `.env` nunca en Git — verificación con `.gitignore`
 - `cf set-env` en lugar de variables hardcodeadas en el código
 - `db/.env` y `db/default-env.json` del HDI Container — nunca en Git
 - `JOB_SECRET_TOKEN` — legacy, sin uso en producción
 
-### 11.3 Diagrama de usuarios y credenciales
+### 10.3 Diagrama de usuarios y credenciales
 - *(insertar Slide 4 del PowerPoint)*
 
 ---
+## 11. Key Pipeline Functions
 
-## 12. Funciones Clave del Pipeline
+> For each function: source module, purpose, inputs, outputs, and the relevant design decision.
 
-> Para cada función: módulo de origen, propósito, inputs principales, output, y decisión de diseño relevante.
-
-### 12.1 Configuración — `app/config.py`
+### 11.1 Configuration — `app/config.py`
 
 **`validate_config()`**
-Verifica que `API_BASE_URL` y `BEARER_TOKEN` están presentes antes de cualquier llamada HTTP. Falla rápido con mensaje claro.
+Verifies that `API_BASE_URL` and `BEARER_TOKEN` are present before any HTTP call is made. Fails fast with a clear error message if either is missing.
 
 **`_load_hana_creds()`**
-Lee credenciales HANA con tres niveles de fallback: 1) variables directas (`os.getenv`), 2) VCAP_SERVICES, 3) retorna vacío para falla controlada.
+Reads HANA credentials with three levels of fallback: 1) direct environment variables via `os.getenv`, 2) `VCAP_SERVICES` JSON injected by Cloud Foundry, 3) returns empty values for controlled failure. This function never raises an exception.
 
 **`get_headers()`**
-Construye el header de autenticación Bearer en cada llamada — no como variable estática.
+Constructs the Bearer authentication header dynamically on each call — not as a static variable — to ensure it always reflects the current token value.
 
 ---
 
-### 12.2 Ingesta — `app/ingest.py`
+### 11.2 Ingestion — `app/ingest.py`
 
 **`fetch_current_window()`**
-- **Input:** ninguno (lee de config)
+- **Input:** None (reads from config)
 - **Output:** `(DataFrame, dict_metadata)`
-- Implementa el loop de paginación: GET /info → GET /logs/current?page=1..N → acumula registros → retorna DataFrame completo
+- Implements the full pagination loop: `GET /info` → `GET /logs/current?page=1..N` → accumulates records → returns complete DataFrame with all records from the current 30-minute window.
 
 **`ingest_and_persist()`**
-- **Input:** ninguno
-- **Output:** dict con métricas del ciclo (total, nuevos, insertados en HANA)
-- Orquesta: `fetch_current_window()` → deduplicación → `save_data()` → `insert_logs()`
+- **Input:** None
+- **Output:** dict with cycle metrics (`total`, `nuevos`, `insertados_sistema`, `insertados_llm`)
+- Orchestrates: `fetch_current_window()` → deduplication → `save_data()` → `insert_logs()`
+- Opens and closes its own HANA connection internally — callers do not manage the connection.
 
 ---
 
-### 12.3 Persistencia en HANA — `app/hana_client.py`
+### 11.3 HANA Persistence — `app/hana_client.py`
 
 **`get_connection()`**
-- **Input:** credenciales de `config.py`
-- **Output:** objeto de conexión `hdbcli` activo
-- Parámetros clave: `encrypt=True`, `sslValidateCertificate=False` (trial), `port=443`
+- **Input:** Credentials from `config.py`
+- **Output:** Active `hdbcli` connection object
+- Key parameters: `encrypt=True`, `sslValidateCertificate=False` (trial instance), `port=443`
 
 **`insert_logs(df)`**
-- **Input:** DataFrame con logs del ciclo actual
-- **Output:** dict `{"sistema": N, "llm": M}` con conteo de inserciones
-- Separa Sistema y LLM → convierte NaN a None → `executemany()` → `conn.commit()`
+- **Input:** DataFrame with current cycle's log records
+- **Output:** `{"sistema": N, "llm": M}` with insertion counts
+- Splits System and LLM records → converts `NaN` to `None` → `cursor.executemany()` → `conn.commit()`
+- `executemany()` sends all rows in a single SQL operation — O(1) in server round trips, reducing insertion time from ~9 minutes (row-by-row) to ~16 seconds for a full window.
 
 ---
 
-### 12.4 Detección rápida — `app/quick_filter.py`
+### 11.4 Quick Detection — `app/quick_filter.py`
 
 **`filtrar_amenazas(df_nuevos)`**
-- **Input:** DataFrame con registros nuevos (crudos, antes del ETL)
-- **Output:** lista de dicts con `alert_type`, `severity`, `details`, `log_id`, `event_time`
-- Aplica las 6 reglas en secuencia, agrupando por batch cuando corresponde
+- **Input:** DataFrame with new records (raw, before ETL)
+- **Output:** `list[dict]` where each dict contains `alert_type`, `severity`, `details`, `log_id`, `event_time`
+- Applies all 6 rules sequentially, aggregating by batch when appropriate
+- Does not modify or filter the input DataFrame — it is an observer, not a filter
 
 ---
 
-### 12.5 Alerting — `app/alerting.py`
+### 11.5 Alerting — `app/alerting.py`
 
-**`enviar_alerta(alert_type, severity, details, log_id, ...)`**
-- **Input:** tipo, severidad, descripción, log_id del registro, y opcionales (conn HANA, window_start, source)
-- **Output:** `AlertResult` (dataclass con `success: bool`, `status_code: int`, `error: str`)
-- Nunca lanza excepciones · anti-duplicados por log_id · retry x3 backoff exponencial
-
----
-
-### 12.6 Feature Engineering — `app/feature_eng.py`
-
-**`build_features_sistema(df)`**
-- **Input:** DataFrame de logs Sistema
-- **Output:** DataFrame con features numéricas para IF Sistema
-- Genera flags booleanos de códigos HTTP, extrae hora UTC, aplica OrdinalEncoder
-
-**`build_features_llm(df)`**
-- **Input:** DataFrame de logs LLM
-- **Output:** DataFrame con features numéricas para IF LLM
-- Aplica `log1p()` a costo, tiempo y tokens; OrdinalEncoder a categóricas
-
-**`build_features_ip(df)`**
-- **Input:** DataFrame de logs Sistema
-- **Output:** DataFrame agregado por IP con métricas de comportamiento
-- Agrupa por IP: conteo de peticiones, rutas únicas, tasa de errores, distribución de status
+**`enviar_alerta(alert_type, severity, details, log_id, event_time, conn, window_start, source)`**
+- **Input:** Alert metadata (type, severity, description, triggering log ID) plus optional HANA connection and source identifier
+- **Output:** `AlertResult` dataclass with `success: bool`, `status_code: int`, `error: str`
+- Constructs the WHAT/WHEN/WHY message → checks anti-duplicate set → INSERT with `alerted=0` → POST to SAP API → UPDATE to `alerted=1` on HTTP 201
+- Never raises exceptions — any error is captured in `AlertResult.error`
+- Retry logic: 3 attempts with exponential backoff (1s → 2s) on 5xx or timeout responses
 
 ---
 
-### 12.7 Modelo ML — `app/model.py`
+### 11.6 HANA Reading for ML — `app/hana_reader.py`
 
-**`run_isolation_forest(df_features, label)`**
-- **Input:** DataFrame de features, string label para logging
-- **Output:** array de anomaly scores
-- Entrena IF con hiperparámetros fijos, retorna scores normalizados
+**`abrir_conexion_hana()`**
+- **Input:** None (reads credentials from config)
+- **Output:** `hdbcli` connection object or `None` on failure
+- Uses double import path (`app.config` / `config`) to work both from repo root and from within `app/`
 
-**`run_lof(df_features)`**
-- **Input:** DataFrame de features agregadas por IP
-- **Output:** array de scores LOF
-- Aplica RobustScaler previo, entrena LOF, retorna scores
+**`leer_sistema_ventana_actual(conn)`**
+- **Input:** Active HANA connection
+- **Output:** DataFrame with 9 columns (LOG_ID, EVENT_TIMESTAMP, LOG_TYPE, HTTP_STATUS, CLIENT_IP, REQUEST_PATH, APPLICATION, REGION_NAME, MESSAGE)
+- Retrieves all system log records from the most recent 30-minute window using `ADD_SECONDS(NOW(), -1800)`
+- Converts `EVENT_TIMESTAMP` to `datetime64[us, UTC]` on read
 
-**`_compute_threshold(scores)`**
-- **Input:** array de scores históricos
-- **Output:** float threshold
-- Calcula `median - 3.5 × (MAD / 0.6745)` — robusto ante outliers
+**`leer_llm_ventana_actual(conn)`**
+- **Input:** Active HANA connection
+- **Output:** DataFrame with 12 columns (LOG_ID, EVENT_TIMESTAMP, LOG_TYPE, LLM_STATUS, LLM_MODEL_ID, LLM_PROVIDER, LLM_COST_USD, LLM_RESPONSE_TIME, LLM_TOTAL_TOKENS, LLM_TEMPERATURE, LLM_ERROR_MESSAGE, LLM_PROMPT_CATEGORY)
 
-**`detectar_anomalias(conn)`**
-- **Input:** conexión HANA activa
-- **Output:** lista de dicts de amenazas detectadas (mismo contrato que `filtrar_amenazas`)
-- Orquesta: `hana_reader` → `feature_eng` → 3 modelos → thresholding → cap de 5 alertas
+**`leer_sistema_historico(conn, horas=24)`**
+- **Input:** Active HANA connection, number of hours of history to retrieve
+- **Output:** DataFrame with same columns as `leer_sistema_ventana_actual`
+- Retrieves records from the past `horas` hours, **excluding** the current 30-minute window to prevent data leakage between training and scoring sets
+
+**`leer_llm_historico(conn, horas=24)`**
+- **Input:** Active HANA connection, number of hours
+- **Output:** DataFrame with same columns as `leer_llm_ventana_actual`
+- Same exclusion logic as `leer_sistema_historico`
+
+**`contar_ventanas_acumuladas(conn)`**
+- **Input:** Active HANA connection
+- **Output:** Integer count of distinct 30-minute windows in HANA
+- Used to determine whether the system operates in cold-start (< 20) or historical (≥ 20) mode
+
+**`en_modo_historico(conn)`**
+- **Input:** Active HANA connection
+- **Output:** Boolean — `True` if ≥ 20 windows accumulated
+- Convenience wrapper around `contar_ventanas_acumuladas()`
 
 ---
 
-## 13. Riesgos Técnicos y Limitaciones
+### 11.7 Feature Engineering — `app/feature_eng.py`
 
-### 13.1 Riesgos de infraestructura
+**`build_sistema_features(df)`**
+- **Input:** DataFrame of system logs (from `leer_sistema_ventana_actual` or `leer_sistema_historico`)
+- **Output:** DataFrame with `LOG_ID` + 9 feature columns (`status_family`, `is_4xx`, `is_5xx`, `is_401_or_403`, `is_429`, `hour_utc`, `LOG_TYPE`, `APPLICATION`, `REGION_NAME`)
+- Casts `HTTP_STATUS` from NVARCHAR to integer with fallback to 200 for unparseable values
+- Fills categorical NaN with `"UNKNOWN"`
+
+**`build_llm_features(df)`**
+- **Input:** DataFrame of LLM logs
+- **Output:** DataFrame with `LOG_ID` + 8 feature columns (`log1p_cost`, `log1p_response_time`, `log1p_total_tokens`, `hour_utc`, `LLM_STATUS`, `LLM_MODEL_ID`, `LLM_PROVIDER`, `LOG_TYPE`)
+- Applies `log1p()` to numerical columns after imputing NaN with median
+- Clips negative values to 0 before applying `log1p`
+
+**`build_ip_behavior_table(df)`**
+- **Input:** DataFrame of system logs
+- **Output:** DataFrame with `CLIENT_IP` + 9 feature columns (`event_count`, `distinct_paths`, `distinct_apps`, `ratio_4xx`, `ratio_5xx`, `ratio_security`, `has_401_or_403`, `has_429`, `n_distinct_status`)
+- Aggregates by `CLIENT_IP` — output has one row per unique IP (~105 rows in production)
+- All ratios are bounded in [0.0, 1.0]; all counts are non-negative integers
+
+---
+
+### 11.8 ML Model — `app/model.py`
+
+**`analizar_ventana(conn, window_start=None)`**
+- **Input:** Active HANA connection (shared from `pipeline_loop.py`), optional window timestamp for logging
+- **Output:** `list[dict]` with maximum 5 elements, each containing `alert_type`, `severity`, `details`, `log_id`, `event_time`
+- Orchestrates the complete ML pipeline: `hana_reader` → `feature_eng` → 3 models → thresholding → severity assignment → cap enforcement
+- Never raises exceptions — any error returns `[]`
+- `conn=None` returns `[]` immediately without attempting any operations
+
+**`_correr_isolation_forest_sistema(df_actual, conn, modo_historico, ...)`**
+- **Input:** Current window DataFrame, HANA connection (for historical data), mode flag, builder functions, feature column lists
+- **Output:** `list[dict]` of detected anomalies
+- If `modo_historico=True`: reads 24h of historical data via `leer_sistema_historico(conn)`, trains IF on history, scores current window
+- If `modo_historico=False`: trains and scores on the current window (cold-start)
+- Constructs a sklearn `Pipeline` with `ColumnTransformer` (RobustScaler for numerics, OrdinalEncoder for categoricals) → `IsolationForest`
+
+**`_correr_isolation_forest_llm(df_actual, conn, modo_historico, ...)`**
+- Same structure as `_correr_isolation_forest_sistema` but operates on LLM features
+
+**`_correr_lof_ip(df_sistema, build_ip_fn, feature_cols)`**
+- **Input:** Current window system logs DataFrame, IP table builder function, feature column list
+- **Output:** `list[dict]` of anomalous IPs
+- Builds IP behaviour table → `RobustScaler` → `LocalOutlierFactor` → identifies IPs with `label == -1`
+- Dynamically adjusts `n_neighbors` if fewer than 20 IPs are present
+
+**`_calcular_threshold(scores, modo_historico)`**
+- **Input:** Array of anomaly scores, mode flag
+- **Output:** Float threshold value
+- Historical mode: `median - 3.5 × (MAD / 0.6745)` — robust to outliers
+- Cold-start mode: `Q1 - 1.5 × IQR` — standard boxplot criterion
+- Returns `-inf` if MAD or IQR is zero (all scores identical → no anomalies)
+
+**`_scores_a_alertas(df_feat, df_original, scores, mask_anomalo, alert_type, context_cols)`**
+- **Input:** Feature DataFrame, original DataFrame, scores array, boolean mask, alert type string, context column names
+- **Output:** `list[dict]` of alerts with severity assigned by rank position
+- Severity assignment: top 10% of anomalies → HIGH, top 10–30% → MEDIUM, remainder → LOW
+- Each alert includes the anomaly score, rank, and relevant context from the original record in the `details` field
+
+---
+
+## 12. Riesgos Técnicos y Limitaciones
+
+### 12.1 Riesgos de infraestructura
 - **HANA trial se pausa por inactividad:** verificar estado Running antes de cada sesión · fallback CSV mitiga pérdida de datos
 - **Ventanas irrecuperables si el pipeline cae:** monitoreo activo con `cf logs` · los organizadores verifican continuidad
 - **Plan hana-free con límites de storage:** ~32GB — suficiente para el hackathon, escala en producción real
 
-### 13.2 Riesgos del modelo de detección
+### 12.2 Riesgos del modelo de detección
 - **Falsos positivos en Quick Filter:** umbrales calibrados empíricamente con datos acumulados — pueden requerir ajuste con más contexto
 - **Modelo ML sin etiquetas:** no hay ground truth para medir precisión exacta — se evalúa por coherencia de las anomalías detectadas
 - **Cap de 5 alertas por ciclo ML:** puede perder anomalías en ciclos con alta actividad — tradeoff deliberado para no saturar el dashboard de SAP
 
-### 13.3 Riesgos de seguridad
+### 12.3 Riesgos de seguridad
 - **Credenciales en historial de Git:** verificado con `git log --all -- .env` antes de hacer el repo público
 - **Token del equipo comprometido:** penalización de bloqueo al día siguiente — credenciales solo en `.env` local y `cf set-env`
 
 ---
 
-## 14. Reporte Forense — Incidentes Reales Detectados
+## 13. Reporte Forense — Incidentes Reales Detectados
 
 > Esta sección documenta anomalías reales detectadas por el sistema en producción, con datos extraídos de `DBADMIN.ALERTS`.
 
-### 14.1 Metodología del análisis forense
+### 13.1 Metodología del análisis forense
 - Fuente de datos: tabla `DBADMIN.ALERTS` con campo `alerted=1` (confirmados por SAP)
 - Período analizado: desde el primer deploy (24 abril) hasta la fecha del reporte
 - Clasificación usando taxonomía Tenable/Nessus
 
-### 14.2 Incidente 1 — [Tipo de amenaza]
+### 13.2 Incidente 1 — [Tipo de amenaza]
 - Qué se detectó
 - Cuándo ocurrió (timestamp exacto)
 - Qué componente lo identificó (quick_filter / model_ml)
@@ -667,13 +1007,13 @@ Construye el header de autenticación Bearer en cada llamada — no como variabl
 - Qué acción tomó el sistema automáticamente
 - Tiempo de respuesta (detección → confirmación SAP)
 
-### 14.3 Incidente 2 — [Tipo de amenaza]
+### 13.3 Incidente 2 — [Tipo de amenaza]
 *(misma estructura)*
 
-### 14.4 Incidente 3 — [Tipo de amenaza]
+### 13.4 Incidente 3 — [Tipo de amenaza]
 *(misma estructura)*
 
-### 14.5 Resumen estadístico de alertas detectadas
+### 13.5 Resumen estadístico de alertas detectadas
 - Total de alertas generadas (alerted=0 + alerted=1)
 - Total de alertas confirmadas por SAP (alerted=1)
 - Distribución por tipo de amenaza
@@ -682,13 +1022,13 @@ Construye el header de autenticación Bearer en cada llamada — no como variabl
 
 ---
 
-## 15. Impacto de Negocio
+## 14. Impacto de Negocio
 
-### 15.1 El problema que resolvemos
+### 14.1 El problema que resolvemos
 - Para quién: equipos de seguridad (CISOs) de empresas enterprise que usan SAP BTP
 - Qué problema concreto: falta de visibilidad en tiempo real sobre amenazas en sistemas críticos
 
-### 15.2 Métricas de éxito del sistema
+### 14.2 Métricas de éxito del sistema
 | Métrica | Objetivo | Resultado obtenido |
 |---|---|---|
 | MTTD | ≤ 2 minutos | ~1 segundo |
@@ -696,12 +1036,12 @@ Construye el header de autenticación Bearer en cada llamada — no como variabl
 | Cobertura temporal | 24/7 | 24/7 desde Abr 24 |
 | Intervención humana requerida | Ninguna | 0 intervenciones |
 
-### 15.3 Comparación con el estándar de la industria
+### 14.3 Comparación con el estándar de la industria
 - MTTD estándar: horas a días
 - Nuestro MTTD: ~1 segundo — mejora de varios órdenes de magnitud
 - Qué significa en términos de impacto: un ataque de brute force que antes se detectaría en horas, ahora genera una alerta en 1 segundo
 
-### 15.4 Escalabilidad y viabilidad en producción
+### 14.4 Escalabilidad y viabilidad en producción
 - Cómo escala el sistema más allá del hackathon
 - Qué cambiaría para producción real: plan HANA de producción, múltiples instancias CF, etiquetas de ataques para supervisar el modelo
 - Visión de autonomous enterprise: cómo el agente IA (tentativo) encaja en la dirección estratégica de SAP
