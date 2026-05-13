@@ -951,25 +951,6 @@ git log --all -p | grep -iE "bearer|password|token|hana_password" | head -20
 # Confirm .gitignore coverage
 cat .gitignore | grep -E "\.env|default-env|node_modules"
 ```
-
-
-## 10. Seguridad y Gestión de Credenciales
-
-### 10.1 Separación de usuarios por principio de mínimo privilegio
-- `DBADMIN`: acceso total — solo para administración y setup
-- `PIPELINE_USER`: SELECT + INSERT + UPDATE sobre las 3 tablas — solo lo necesario para el pipeline
-- `SAC_USER`: SELECT + roles HDI — solo lectura para dashboards
-- `#OO / #DI`: usuarios técnicos del HDI Container — gestionados por SAP
-
-### 10.2 Gestión de credenciales
-- `.env` nunca en Git — verificación con `.gitignore`
-- `cf set-env` en lugar de variables hardcodeadas en el código
-- `db/.env` y `db/default-env.json` del HDI Container — nunca en Git
-- `JOB_SECRET_TOKEN` — legacy, sin uso en producción
-
-### 10.3 Diagrama de usuarios y credenciales
-- *(insertar Slide 4 del PowerPoint)*
-
 ---
 ## 11. Key Pipeline Functions
 
