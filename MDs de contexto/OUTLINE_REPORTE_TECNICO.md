@@ -732,58 +732,226 @@ Long cycle (every 28 min):
 
 Each connection is opened immediately before use and closed in a `finally` block, guaranteeing cleanup regardless of success or failure.
 
+## 8. Visualization — SAP Analytics Cloud
+
+### 8.1 SAC–HANA Connection Architecture
+
+SAP Analytics Cloud (SAC) cannot connect directly to raw HANA tables. The connection requires an intermediate layer of objects deployed inside an **HDI Container** (HANA Deployment Infrastructure Container), which acts as an isolated namespace within HANA with its own roles, users, and object lifecycle.
+
+The connection chain is:
+
+```
+DBADMIN.<TABLE>  (source table in HANA)
+        │
+        │  .hdbsynonym — named reference to external table
+        ▼
+HDI Container (isolated namespace, created via CF service)
+        │
+        │  .hdbcalculationview — type CUBE, with measures and attributes
+        ▼
+SAP Analytics Cloud
+        │
+        │  Live Connection — SAC queries HANA in real time
+        ▼
+SOC Dashboard (auto-refreshes as pipeline inserts new data)
+```
+
+Each component in this chain exists for a specific technical reason:
+
+**Synonyms** bridge the schema boundary. HDI Containers cannot access tables outside their own schema. A synonym creates a named reference from the container's namespace to an external table (e.g., `DBADMIN.RAW_LOGS_LLM`), allowing objects inside the container to read the data.
+
+**HDI Container** (`Prod_Vizz`) provides the isolated environment that SAC requires. The container is created as a Cloud Foundry service (`hana`, plan `hdi-shared`) and managed through an MTA (Multi-Target Application) project deployed from SAP Business Application Studio. When the container is created, HANA automatically generates two technical users: `#OO` (Object Owner, owns all deployed objects) and `#DI` (Deployment Infrastructure, handles deploy operations).
+
+**Calculation Views** (type CUBE) are the only object type that SAC Live Connection can consume as a data source. Each Calculation View defines which columns from the source table are exposed to SAC, and classifies them as either **measures** (numeric columns with an aggregation function — SUM, AVG, COUNT) or **attributes** (categorical and temporal columns used for filtering and grouping). SAC requires at least one measure to render any chart.
+
+The Live Connection means SAC does not import or copy data. Every time a dashboard is viewed, SAC sends a query to HANA through the Calculation View and receives the current data. This means the dashboard always reflects the latest records inserted by the pipeline.
+
+### 8.2 Calculation View Status
+
+Three Calculation Views are required — one per HANA table:
+
+**CV_LOGS_LLM** — ✅ Operational
+
+Exposes the `RAW_LOGS_LLM` table with the following structure:
+
+| Column | Role | Aggregation | Purpose in Dashboard |
+|---|---|---|---|
+| `LLM_TOTAL_TOKENS` | Measure | SUM | Token consumption over time |
+| `LLM_COST_USD` | Measure | SUM | Cost accumulation and spend analysis |
+| `LLM_RESPONSE_TIME` | Measure | AVG | Response latency monitoring |
+| `LLM_PROVIDER` | Attribute | — | Filter/group by AI provider |
+| `LLM_MODEL_ID` | Attribute | — | Filter/group by model |
+| `LLM_STATUS` | Attribute | — | Success vs error vs timeout breakdown |
+| `EVENT_TIMESTAMP` | Attribute | — | Time axis for all temporal charts |
+| `LOG_TYPE` | Attribute | — | LLM_REQUEST / LLM_ERROR / LLM_TIMEOUT |
+| `REGION_NAME` | Attribute | — | Geographic distribution |
+
+**CV_LOGS_SISTEMA** — ✅ Operational
+
+Exposes the `RAW_LOGS_SISTEMA` table. Attributes include `LOG_TYPE`, `HTTP_STATUS`, `CLIENT_IP`, `REQUEST_PATH`, `APPLICATION`, `REGION_NAME`, and `EVENT_TIMESTAMP`. The `ID` column serves as the counting measure (aggregation: COUNT), enabling volume-based visualizations such as events per time window or HTTP status distribution.
+
+**CV_ALERTS** — ✅ Operational
+
+Exposes the `ALERTS` table. Attributes include `ALERT_TYPE`, `SEVERITY`, `DETECTION_SOURCE`, `DETECTED_AT`, and `WINDOW_START`. The `ALERTED` column serves as a measure (aggregation: SUM) to distinguish confirmed alerts (value 1) from pending ones (value 0), enabling confirmation rate tracking in the dashboard.
+
+### 8.3 Users and SAC Access
+
+SAC connects to HANA using a dedicated read-only user that has been granted the minimum permissions required to query the Calculation Views:
+
+**SAC_USER** has:
+
+- `SELECT` on the `DBADMIN` schema — allows reading from the source tables through the synonym layer.
+- `access_role` from the HDI Container — provides read access to all deployed objects (synonyms and Calculation Views) within the container.
+- `external_privileges_role` from the HDI Container — allows the container's objects to access external schemas on behalf of SAC_USER.
+
+The permission grant sequence is order-dependent: the HDI Container must exist before roles can be granted, and the `#OO` user must have `SELECT WITH GRANT OPTION` on each source table before the Calculation View referencing that table can be deployed. This means adding a new table to the dashboard requires granting `#OO` access first, deploying the new synonym and Calculation View, and then SAC_USER gains access automatically through the existing `access_role`.
+
+User separation is enforced strictly:
+
+| User | Can Read | Can Write | Can Deploy | Used By |
+|---|---|---|---|---|
+| DBADMIN | Everything | Everything | Everything | Administrators only |
+| PIPELINE_USER | Data tables | Data tables | No | Pipeline (Cloud Foundry) |
+| SAC_USER | Calc Views only | No | No | SAC dashboards |
+| #OO / #DI | Container objects | Container objects | Yes (automated) | HDI system |
+
+PIPELINE_USER is never used for SAC. SAC_USER is never used for the pipeline. This separation ensures that a compromised dashboard credential cannot modify data, and a compromised pipeline credential cannot access visualization infrastructure.
+
+### 8.4 SOC Dashboard
+
+The SOC Dashboard in SAP Analytics Cloud provides the operational monitoring interface for the security team. It is built on the three Calculation Views described above and organized around the key monitoring priorities of the SOC.
+
+The dashboard includes the following visualizations:
+
+- Log volume by time window — time series showing ingestion rate and data completeness across system and LLM logs.
+- HTTP status distribution — breakdown of response codes to identify shifts toward error-heavy traffic.
+- Alert timeline — alerts plotted by detection time, colored by severity, filterable by type and detection source (quick_filter vs model_ml).
+- LLM cost and token analysis — accumulated spend by provider and model, response time trends, and error rate by provider.
+- Regional activity distribution — geographic breakdown of access patterns.
+- Alert confirmation rate — ratio of confirmed alerts (ALERTED = 1) to total detected, indicating pipeline-to-SAP communication health.
+
+*(Dashboard screenshots are included as evidence in the repository.)*
+
 ---
 
-## 8. Visualización — SAP Analytics Cloud
+## 9. MLOps and Cloud Foundry Deployment
 
-### 8.1 Arquitectura de la conexión SAC–HANA
-- HDI Container `Prod_Vizz`: qué es y por qué se necesita para la Live Connection
-- Synonyms: puente entre el schema DBADMIN y el HDI Container
-- Calculation Views: tipo CUBE, measures y attributes expuestos a SAC
+### 9.1 Deployment Configuration
 
-### 8.2 Estado actual de los Calculation Views
-- `CV_LOGS_LLM` ✅ — operativo: measures (tokens, costo, tiempo de respuesta), attributes (proveedor, modelo, región, status)
-- `CV_LOGS_SISTEMA` ⏳ — en progreso
-- `CV_ALERTS` ⏳ — en progreso
+The application is deployed to SAP BTP Cloud Foundry using three configuration files at the project root:
 
-### 8.3 Usuarios y acceso a SAC
-- `SAC_USER`: permisos SELECT + roles HDI `access_role` y `external_privileges_role`
-- Separación de usuarios: SAC_USER ≠ PIPELINE_USER ≠ DBADMIN
+**`manifest.yml`** defines the runtime environment:
 
-### 8.4 Dashboard del SOC
-- Métricas y visualizaciones planeadas
-- Screenshots del dashboard actual *(insertar evidencia)*
+| Parameter | Value | Rationale |
+|---|---|---|
+| `command` | `python pipeline_loop.py` | Same entry point as local development |
+| `health-check-type` | `process` | CF monitors whether the Python process is alive (not HTTP — the pipeline is a loop, not a web server) |
+| `memory` | `1024M` | Sufficient for pandas operations and ML model training |
+| `disk_quota` | `2G` | Accommodates CSV backups generated each window |
+| `instances` | `1` | Mandatory — multiple instances would cause duplicate ingestion and break in-memory deduplication |
+| `buildpacks` | `python_buildpack` | CF installs dependencies from `requirements.txt` automatically |
+| `services` | `sap-soc-hana`, `pyuaa` | HANA service binding (injects `VCAP_SERVICES`) and XSUAA for BTP authentication |
+
+**`requirements.txt`** lists all Python dependencies for the production environment: Flask, requests, pandas, numpy, hdbcli, python-dotenv, and scikit-learn.
+
+**`runtime.txt`** specifies the Python version: `python-3.11.x`.
+
+The manifest does not contain any credentials. HANA credentials are injected automatically through the service binding (`VCAP_SERVICES`), and API credentials are set post-deployment via `cf set-env`.
+
+### 9.2 Credential Management by Environment
+
+The same codebase runs in two environments with different credential sources. The `_load_hana_creds()` function in `config.py` handles this transparently:
+
+**Priority 1 — Direct environment variables** (`cf set-env` in Cloud Foundry, `.env` locally): If `HANA_HOST` and `HANA_USER` are present as environment variables, they are used immediately. This covers both local development (where `.env` is loaded by `python-dotenv`) and Cloud Foundry (where `cf set-env` injects them).
+
+**Priority 2 — `VCAP_SERVICES`**: If direct variables are not set, the function parses the `VCAP_SERVICES` JSON (auto-injected by Cloud Foundry when a service binding exists). It extracts `host`, `port`, `user`, and `password` from the HANA service credentials. This path is active when the app relies on the service binding declared in `manifest.yml` rather than explicit environment variables.
+
+**Priority 3 — Controlled failure**: If neither source provides credentials, the function returns empty strings. Downstream modules detect this and operate in degraded mode (CSV-only, no HANA).
+
+In practice, the production deployment uses direct environment variables set via `cf set-env` as the primary credential source. The `VCAP_SERVICES` path exists as a fallback for environments where service bindings provide credentials directly. Additionally, a `.venv` virtual environment can be used within the Cloud Foundry workspace to manage credentials locally during development.
+
+The `VCAP_SERVICES` configuration also binds XSUAA (`pyuaa`), which is required by the BTP platform for service-to-service authentication. The pipeline code does not consume XSUAA credentials directly — the binding exists to satisfy BTP's deployment requirements.
+
+### 9.3 Monitoring and Observability
+
+The pipeline implements dual logging: every log message is written simultaneously to the console (for real-time monitoring via `cf logs`) and to a persistent file (`pipeline_v2.log`) that survives process restarts within the same container.
+
+Each log entry includes both UTC and local time (Monterrey, CDT = UTC−6) for quick human reference:
+
+```
+2026-05-04 06:31:02 UTC | INFO | CICLO #142 — Iniciando
+```
+
+Key monitoring commands for the deployed application:
+
+```bash
+cf logs sap-ai-soc-papoi --recent    # Last N lines of output
+cf logs sap-ai-soc-papoi             # Live stream
+cf app sap-ai-soc-papoi              # Memory, CPU, uptime, status
+cf restart sap-ai-soc-papoi          # Restart the pipeline
+```
+
+The pipeline logs every cycle with a structured summary: records extracted, new records after deduplication, HANA insertion counts, threats detected, alerts sent, alerts failed, and duplicates skipped. This provides a complete operational audit trail.
+
+### 9.4 Error Handling in the Pipeline Loop
+
+The pipeline is designed to never stop permanently. Error handling follows a severity-based strategy:
+
+| Error Condition | Classification | Action |
+|---|---|---|
+| HTTP 401 (invalid token) | Fatal | Log error → `sys.exit(1)`. The token is invalid — no amount of retrying will fix it. Requires manual intervention. |
+| HTTP 5xx (server error) | Recoverable | Log warning → wait 60 seconds → retry the cycle. The API server may recover. |
+| Network timeout / ConnectionError | Recoverable | Log warning → wait 60 seconds → retry. Transient network issues resolve on their own. |
+| HANA not available | Degraded | Log warning → continue with CSV-only. HANA Cloud trial pauses after inactivity; the next cycle will retry the connection. Data is preserved in CSV and can be backfilled. |
+| `quick_filter` or `model` import failure | Degraded | Log warning → continue without detection. Ingestion never stops because of a detection module error. |
+| `alerting` failure per alert | Non-blocking | Log error → continue to next alert. One failed alert does not prevent others from being sent. |
+| `KeyboardInterrupt` (Ctrl+C) | Clean shutdown | Log final report with total cycles completed → `sys.exit(0)`. |
+| Unexpected exception | Recoverable | Log full traceback → wait 60 seconds → retry. Catches unforeseen edge cases without terminating. |
+
+This hierarchy ensures that the pipeline's primary function (data ingestion) is protected at all costs. Detection and alerting are important but secondary — their failure never compromises data collection.
 
 ---
 
-## 9. MLOps y Despliegue en Cloud Foundry
+## 10. Security and Credential Management
 
-### 9.1 Configuración del despliegue
-- `manifest.yml`: comando de inicio, `health-check-type: process`, memoria, instancias
-- `requirements.txt`: dependencias del entorno de producción
-- `runtime.txt`: versión de Python
+### 10.1 User Separation by Principle of Least Privilege
 
-### 9.2 Gestión de credenciales por entorno
-- Local: `.env` → `os.getenv()` → DBADMIN
-- Producción (CF): `cf set-env` → User-Provided variables → PIPELINE_USER
-- La función `_load_hana_creds()`: prioridad 1) variables directas, 2) VCAP_SERVICES, 3) falla controlada
-- VCAP_SERVICES: hana y xsuaa bound — no consumidos activamente por el código
+The system enforces strict separation of database users, each with only the permissions required for its specific function:
 
-### 9.3 Monitoreo y observabilidad
-- Logging dual: consola (tiempo real) + `pipeline.log` (historial persistente)
-- Cada mensaje incluye hora UTC y hora Monterrey (CDT = UTC-6)
-- `cf logs sap-ai-soc-papoi --recent` para diagnóstico
+**DBADMIN** — Full administrative access. Used exclusively for initial setup: creating tables, creating other users, granting permissions, and deploying HDI Containers. Never used by the running pipeline or by SAC. Access is restricted to the infrastructure administrators.
 
-### 9.4 Manejo de errores en el loop
-- HTTP 401 → `sys.exit(1)` — fatal, no sirve reintentar
-- HTTP 5xx / Timeout → esperar 60s + reintentar
-- HANA no disponible → continuar solo con CSV
-- `KeyboardInterrupt` → cierre limpio con reporte de ciclos completados
+**PIPELINE_USER** — Read and write access to the three data tables (`RAW_LOGS_SISTEMA`, `RAW_LOGS_LLM`, `ALERTS`). This is the user configured in Cloud Foundry via `cf set-env`. It can SELECT, INSERT, and UPDATE data, but it cannot create or drop tables, create users, or modify permissions. The pipeline uses this user for all automated operations.
 
-### 9.5 Diagrama del Pipeline Loop
-- *(insertar Slide 3 del PowerPoint)*
+**SAC_USER** — Read-only access through the HDI Container's Calculation Views. This user has `SELECT` on the DBADMIN schema and the HDI Container's `access_role` and `external_privileges_role`. It cannot write data, modify table structures, or access objects outside the Calculation Views. SAC connects exclusively through this user.
 
----
+**#OO and #DI** — Technical users automatically created and managed by the HDI Container runtime. `#OO` (Object Owner) owns all objects deployed within the container and requires `SELECT WITH GRANT OPTION` on external tables to propagate access through the container roles. `#DI` (Deployment Infrastructure) handles deployment operations. Neither user is accessed manually — they are managed entirely by the SAP HDI system.
+
+This separation ensures that compromising any single credential limits the blast radius: a leaked SAC_USER password exposes read-only access to aggregated views; a leaked PIPELINE_USER password exposes write access to data tables but not to infrastructure; DBADMIN credentials are never deployed to any running service.
+
+### 10.2 Credential Management
+
+All credentials follow the principle of never appearing in source code or version control:
+
+**Local development:** Credentials are stored in a `.env` file at the project root. This file is listed in `.gitignore` and is never committed. The `config.py` module loads it using `python-dotenv` with `override=False`, meaning system environment variables take precedence over `.env` values.
+
+**Cloud Foundry production:** API credentials (`BEARER_TOKEN`, `API_BASE_URL`) are set using `cf set-env` after deployment. HANA credentials are injected through the service binding declared in `manifest.yml`, which populates `VCAP_SERVICES` automatically. No credentials appear in `manifest.yml` or in any file that enters version control.
+
+**HDI Container artifacts:** The HDI project in SAP Business Application Studio generates a `db/.env` and `db/default-env.json` containing service binding credentials for the development workspace. These files are excluded from Git via `.gitignore` entries and must never be committed.
+
+**Verification before making the repository public:**
+
+```bash
+# Check that .env has never been committed
+git log --all --diff-filter=A -- .env
+git log --all --diff-filter=A -- '*/default-env.json'
+
+# Scan commit history for credential patterns
+git log --all -p | grep -iE "bearer|password|token|hana_password" | head -20
+
+# Confirm .gitignore coverage
+cat .gitignore | grep -E "\.env|default-env|node_modules"
+```
+
 
 ## 10. Seguridad y Gestión de Credenciales
 
