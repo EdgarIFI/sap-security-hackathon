@@ -32,10 +32,10 @@ applications:
     # Nombre de la aplicación en Cloud Foundry.
     # Debe ser único en tu organización.
 
-    memory: 1024M
+    memory: 2048M
     # RAM asignada al proceso.
     # 512MB es suficiente para el pipeline con pandas.
-    # Si el modelo ML es pesado, aumentar a 1024M.
+    # Si el modelo ML es pesado, aumentar.
 
     disk_quota: 2G
     # Espacio en disco para CSVs temporales.
