@@ -189,8 +189,10 @@ def filtrar_amenazas(df: pd.DataFrame) -> list[dict]:
     # --- Reglas sobre logs LLM ---
     if not df_llm.empty:
         amenazas.extend(_regla_llm_error_costo_alto(df_llm))
-        amenazas.extend(_regla_llm_timeout(df_llm))
-        amenazas.extend(_regla_llm_respuesta_lenta(df_llm))
+        # DESACTIVADO: llm_timeout genera falsos positivos — feedback Santiago Reyes 13-May-2026
+        # amenazas.extend(_regla_llm_timeout(df_llm))
+        # DESACTIVADO: slow_llm_response genera falsos positivos — feedback Santiago Reyes 13-May-2026
+        # amenazas.extend(_regla_llm_respuesta_lenta(df_llm))
 
     if amenazas:
         logger.warning(
@@ -250,9 +252,10 @@ def _regla_security_event(df: pd.DataFrame) -> list[dict]:
         status_str = "N/A"
 
     details = (
-        f"{count} SECURITY event(s) in this batch. "
-        f"IPs: {ips_str if ips_str else 'unknown'}. "
-        f"Status: {status_str}"
+        f"SECURITY ALERT: {count} flagged event(s) detected. "
+        f"Involved IPs: {ips_str if ips_str else 'unknown'}. "
+        f"HTTP status breakdown: {status_str}. "
+        f"Immediate review recommended."
     )
 
     severity = "high" if count >= 3 else "medium"
@@ -336,8 +339,9 @@ def _regla_brute_force(df: pd.DataFrame) -> list[dict]:
         )
 
         details = (
-            f"{intentos} auth failures from IP {ip} "
-            f"in this polling cycle ({status_str})"
+            f"BRUTE FORCE: {intentos} consecutive auth failures from IP {ip}. "
+            f"Breakdown: {status_str}. "
+            f"Credential attack in progress — block IP immediately."
         )
 
         resultados.append(_amenaza(

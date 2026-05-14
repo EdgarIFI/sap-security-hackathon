@@ -155,6 +155,40 @@ def _cerrar_conexion_hana(conn):
         except Exception:
             pass
 
+def _ip_ya_alertada_por_qf(conn, ip: str, ventana_inicio: str) -> bool:
+    """
+    Verifica si quick_filter ya envió una alerta sobre esta IP
+    en la ventana actual o en la hora previa.
+
+    Retorna True si existe una alerta de quick_filter para esta IP
+    en DBADMIN.ALERTS dentro de la última hora — en ese caso,
+    la alerta ML debe ser suprimida para evitar doble conteo.
+
+    Retorna False si no hay solapamiento, o si conn es None
+    (comportamiento seguro: sin conexión, no suprimir).
+    """
+    if conn is None or not ip:
+        return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT COUNT(*) FROM DBADMIN.ALERTS
+            WHERE DETECTION_SOURCE = 'quick_filter'
+              AND (DETAILS LIKE ? OR DETAILS LIKE ?)
+              AND DETECTED_AT >= ADD_SECONDS(NOW(), -3600)
+              AND ALERTED = 1
+            """,
+            (f"%{ip}%", f"%IP {ip}%"),
+        )
+        row = cursor.fetchone()
+        cursor.close()
+        count = int(row[0]) if row else 0
+        return count > 0
+    except Exception as e:
+        logger.warning(f"[SUPRESS] Error verificando IP {ip} en ALERTS: {e}")
+        return False  # ante cualquier error, no suprimir
+    
 # =============================================================================
 # CONSTANTES
 # =============================================================================
@@ -164,9 +198,9 @@ SEGUNDOS_REINTENTO = 60
 ERRORES_FATALES_HTTP = {401}
 
 # Ciclo corto — detección en tiempo real con quick_filter
-# Cada 2 minutos sobre la ventana activa → MTTD ≤ 2 minutos
+# Cada 10 minutos sobre la ventana activa → MTTD ≤ 10 minutos
 # Impacto directo en el criterio #1 (40% del score)
-INTERVALO_POLLING_CORTO = 60 * 2    # 2 minutos
+INTERVALO_POLLING_CORTO = 60 * 10    # 10 minutos
 
 # Ciclo largo — reservado para model.py (AI Specialist)
 # Se activa cuando se detecta cambio de ventana UTC
@@ -547,29 +581,71 @@ def main():
                         conn_alerting_ml = _abrir_conexion_hana()
                         try:
                             for anomalia in anomalias_ml:
-                                if ALERTING_DISPONIBLE:
-                                    result = enviar_alerta(
-                                        alert_type   = anomalia["alert_type"],
-                                        severity     = anomalia["severity"],
-                                        details      = anomalia["details"],
-                                        log_id       = anomalia["log_id"],
-                                        event_time   = anomalia.get("event_time"),
-                                        conn         = conn_alerting_ml,
-                                        window_start = ventana_inicio_ultimo_ciclo,
-                                        source       = "model_ml",
+                                if not ALERTING_DISPONIBLE:
+                                    continue
+
+                                # ── Supresión de duplicados entre fuentes ─────
+                                # Si quick_filter ya alertó sobre esta IP en la
+                                # última hora, registramos la alerta ML como
+                                # suprimida en HANA pero NO la enviamos a SAP.
+                                # Esto evita que SAP reciba dos alertas sobre el
+                                # mismo incidente visto desde dos perspectivas.
+                                ip_en_details = ""
+                                if anomalia["alert_type"] == "ml_ip_anomaly":
+                                    # Extraer IP del campo details: "IP X.X.X.X: N eventos..."
+                                    try:
+                                        ip_en_details = anomalia["details"].split("IP ")[1].split(":")[0].strip()
+                                    except (IndexError, AttributeError):
+                                        ip_en_details = ""
+
+                                if ip_en_details and _ip_ya_alertada_por_qf(
+                                    conn_alerting_ml, ip_en_details, ventana_inicio_ultimo_ciclo
+                                ):
+                                    # Registrar en HANA como suprimida (para auditoría forense)
+                                    try:
+                                        cursor = conn_alerting_ml.cursor()
+                                        cursor.execute(
+                                            """
+                                            UPDATE DBADMIN.ALERTS
+                                            SET SUPPRESSED_BY = 'quick_filter'
+                                            WHERE LOG_ID = ? AND DETECTION_SOURCE = 'model_ml'
+                                            """,
+                                            (anomalia["log_id"],)
+                                        )
+                                        conn_alerting_ml.commit()
+                                        cursor.close()
+                                    except Exception as e:
+                                        logger.warning(f"[SUPRESS] No se pudo marcar suprimida: {e}")
+
+                                    logger.info(
+                                        f"[CICLO-LARGO] ⏭ Alerta ML suprimida (ya cubierta por quick_filter) | "
+                                        f"IP={ip_en_details} | type={anomalia['alert_type']}"
                                     )
-                                    if result.ok:
-                                        logger.info(
-                                            f"[CICLO-LARGO] ✅ Alerta ML enviada | "
-                                            f"type={anomalia['alert_type']} "
-                                            f"({anomalia['severity']}) | "
-                                            f"HTTP {result.status_code}"
-                                        )
-                                    else:
-                                        logger.error(
-                                            f"[CICLO-LARGO] ❌ Alerta ML fallida | "
-                                            f"error={result.error}"
-                                        )
+                                    continue  # no enviar a SAP
+
+                                # ── Enviar alerta ML normalmente ──────────────
+                                result = enviar_alerta(
+                                    alert_type   = anomalia["alert_type"],
+                                    severity     = anomalia["severity"],
+                                    details      = anomalia["details"],
+                                    log_id       = anomalia["log_id"],
+                                    event_time   = anomalia.get("event_time"),
+                                    conn         = conn_alerting_ml,
+                                    window_start = ventana_inicio_ultimo_ciclo,
+                                    source       = "model_ml",
+                                )
+                                if result.ok:
+                                    logger.info(
+                                        f"[CICLO-LARGO] ✅ Alerta ML enviada | "
+                                        f"type={anomalia['alert_type']} "
+                                        f"({anomalia['severity']}) | "
+                                        f"HTTP {result.status_code}"
+                                    )
+                                else:
+                                    logger.error(
+                                        f"[CICLO-LARGO] ❌ Alerta ML fallida | "
+                                        f"error={result.error}"
+                                    )
                         finally:
                             _cerrar_conexion_hana(conn_alerting_ml)
                     else:
