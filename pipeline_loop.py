@@ -601,21 +601,32 @@ def main():
                                 if ip_en_details and _ip_ya_alertada_por_qf(
                                     conn_alerting_ml, ip_en_details, ventana_inicio_ultimo_ciclo
                                 ):
-                                    # Registrar en HANA como suprimida (para auditoría forense)
+                                    # Insertar en HANA como suprimida para auditoria forense
+                                    # (no se envia a SAP pero si queda registrada con SUPPRESSED_BY)
                                     try:
+                                        import uuid as _uuid
                                         cursor = conn_alerting_ml.cursor()
                                         cursor.execute(
                                             """
-                                            UPDATE DBADMIN.ALERTS
-                                            SET SUPPRESSED_BY = 'quick_filter'
-                                            WHERE LOG_ID = ? AND DETECTION_SOURCE = 'model_ml'
+                                            INSERT INTO DBADMIN.ALERTS
+                                                (ALERT_ID, LOG_ID, DETECTED_AT, DETECTION_SOURCE,
+                                                ALERT_TYPE, SEVERITY, DETAILS, WINDOW_START,
+                                                ALERTED, SUPPRESSED_BY)
+                                            VALUES (?, ?, NOW(), 'model_ml', ?, ?, ?, ?, 0, 'quick_filter')
                                             """,
-                                            (anomalia["log_id"],)
+                                            (
+                                                str(_uuid.uuid4()),
+                                                anomalia["log_id"],
+                                                anomalia["alert_type"],
+                                                anomalia["severity"],
+                                                anomalia["details"][:500],
+                                                ventana_inicio_ultimo_ciclo,
+                                            )
                                         )
                                         conn_alerting_ml.commit()
                                         cursor.close()
                                     except Exception as e:
-                                        logger.warning(f"[SUPRESS] No se pudo marcar suprimida: {e}")
+                                        logger.warning(f"[SUPRESS] No se pudo insertar alerta suprimida: {e}")
 
                                     logger.info(
                                         f"[CICLO-LARGO] ⏭ Alerta ML suprimida (ya cubierta por quick_filter) | "
