@@ -15,11 +15,12 @@ Principios:
 
 Owner: Dev 1
 """
-from dotenv import load_dotenv
-load_dotenv()
 
 import sys
 import os
+
+from dotenv import load_dotenv
+load_dotenv()  # carga .env para desarrollo local (no-op en CF donde las vars vienen del entorno)
 
 # ── sys.path: permite importar módulos hermanos desde cualquier CWD.
 #    Añade el directorio de este archivo (dashboard/) antes de cualquier import.
@@ -56,6 +57,51 @@ st.set_page_config(
 # ══════════════════════════════════════════════════════════════════════════════
 # SESSION STATE — inicialización de claves
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+# ── CSS global — mejoras de presentación ─────────────────────────────────────
+st.markdown("""
+<style>
+/* Quitar padding excesivo del top */
+.block-container { padding-top: 1.5rem !important; }
+
+/* Cards de métricas más definidos */
+[data-testid="metric-container"] {
+    background: #1A1A2E;
+    border: 1px solid #0066CC33;
+    border-radius: 8px;
+    padding: 1rem 1.2rem;
+}
+
+/* Botón refresh más compacto */
+[data-testid="stButton"] button {
+    border-radius: 6px;
+}
+
+/* Chat input styling */
+[data-testid="stChatInput"] {
+    border-radius: 12px;
+}
+
+/* Tabla de alertas — filas alternadas */
+[data-testid="stHorizontalBlock"]:nth-child(even) {
+    background: rgba(255,255,255,0.02);
+    border-radius: 4px;
+}
+
+/* Panel derecho — borde sutil */
+.panel-chart-container {
+    border-left: 1px solid #0066CC22;
+    padding-left: 1rem;
+}
+
+/* Suggestion buttons más compactos */
+.stButton > button[kind="secondary"] {
+    font-size: 0.8rem;
+    padding: 0.3rem 0.6rem;
+}
+</style>
+""", unsafe_allow_html=True)
 
 def _init_session_state() -> None:
     """
@@ -104,7 +150,11 @@ def render_header() -> None:
     with col_title:
         st.markdown("## 🛡️ SAP AI Security Operations Center")
         last_str = st.session_state["last_refresh"].strftime("%Y-%m-%d  %H:%M:%S UTC")
-        st.caption(f"Datos cargados: {last_str}  ·  Pipeline: `sap-ai-soc-papoi` (read-only)")
+        st.caption(
+            f"Datos cargados: {last_str}  ·  "
+            f"Pipeline: `sap-ai-soc-papoi` (read-only)  ·  "
+            f"TEC de Monterrey × SAP Hackathon 2026"
+        )
 
     with col_refresh:
         st.write("")  # padding vertical
@@ -133,10 +183,14 @@ def render_kpis(kpis: dict) -> None:
     threat_icon = {"NORMAL": "🟢", "ELEVATED": "🟡", "CRITICAL": "🔴"}.get(
         kpis["threat_level"], "⚪"
     )
-    col1.metric(
-        label="Threat Level",
-        value=f"{threat_icon} {kpis['threat_level']}",
+    threat_colors = {"NORMAL": "#00C851", "ELEVATED": "#FFB300", "CRITICAL": "#FF4444"}
+    threat_color  = threat_colors.get(kpis["threat_level"], "#888888")
+    threat_html = (
+        f"**Threat Level**<br>"
+        f"<span style='font-size:1.5rem; color:{threat_color}; font-weight:700;'>"
+        f"{threat_icon} {kpis['threat_level']}</span>"
     )
+    col1.markdown(threat_html, unsafe_allow_html=True)
 
     # KPI 2 — Alerts Last Hour (con delta porcentual)
     delta_pct = kpis.get("alerts_delta_pct")
@@ -182,7 +236,7 @@ def render_activity_chart(conn) -> None:
 
     Ambos filtros operan sobre el DataFrame en memoria. Sin queries adicionales a HANA.
     """
-    st.subheader("System Activity Timeline (últimas 48h)")
+    st.markdown("#### 📈 System Activity Timeline — últimas 48h")
 
     try:
         df = get_activity_timeline(conn)
@@ -218,7 +272,7 @@ def render_activity_chart(conn) -> None:
 
     try:
         fig = build_activity_chart(df_f)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key="activity_timeline_chart")
     except Exception as exc:
         st.error(f"Error al renderizar la gráfica de actividad: {exc}")
 
@@ -242,7 +296,7 @@ def render_critical_alerts_table(conn) -> None:
     - only_high:   toggle para mostrar solo severity=high.
     Ambos filtran el DataFrame en Python.
     """
-    st.subheader("Critical Alerts (últimas 24h)")
+    st.markdown("#### 🚨 Critical Alerts — últimas 24h")
 
     try:
         df = get_critical_alerts(conn, hours=24, limit=20)
@@ -414,7 +468,13 @@ def _process_question(question: str, conn, alert_context: dict | None) -> None:
             try:
                 chart_data   = get_chart_data(conn, result["chart_key"])
                 chart_figure = build_chart(result["chart_key"], chart_data)
-                st.plotly_chart(chart_figure, use_container_width=True)
+                n_msgs = len(st.session_state["messages"])
+                chart_k = result["chart_key"] or "chart"
+                st.plotly_chart(
+                    chart_figure,
+                    use_container_width=True,
+                    key=f"chat_inline_{chart_k}_{n_msgs}",
+                )
 
                 # Actualizar el panel de gráfica dinámica del lado derecho
                 st.session_state["current_chart"] = {
@@ -453,18 +513,26 @@ def render_dynamic_chart_panel(conn) -> None:
 
     if current:
         chart_desc = CHART_CATALOG.get(current["key"], current["key"])
-        st.subheader(f"📊 {chart_desc}")
+        st.markdown(f"#### 📊 {chart_desc}")
 
         # Recargar la gráfica desde HANA (datos frescos en cada render del panel)
         try:
             fresh_data   = get_chart_data(conn, current["key"])
             fresh_figure = build_chart(current["key"], fresh_data)
-            st.plotly_chart(fresh_figure, use_container_width=True)
+            st.plotly_chart(
+                fresh_figure,
+                use_container_width=True,
+                key=f"panel_fresh_{current['key']}",
+            )
         except Exception as exc:
             # Fallback: usar la figura guardada en session_state si la recarga falla
             if current.get("figure"):
                 st.caption(f"_(Mostrando datos previos — error al recargar: {exc})_")
-                st.plotly_chart(current["figure"], use_container_width=True)
+                st.plotly_chart(
+                current["figure"],
+                use_container_width=True,
+                key=f"panel_fallback_{current['key']}",
+            )
             else:
                 st.error(f"Error al cargar la gráfica: {exc}")
 
@@ -473,7 +541,7 @@ def render_dynamic_chart_panel(conn) -> None:
             st.session_state["current_chart"] = None
             st.rerun()
     else:
-        st.subheader("📊 Gráfica dinámica")
+        st.markdown("#### 📊 Gráfica dinámica")
         st.info(
             "Las gráficas aparecen aquí cuando el agente sugiere una análisis visual,\n"
             "o cuando haces click en **¿Qué hago? →** en la tabla de alertas."
@@ -504,7 +572,7 @@ def render_chat_tab(conn) -> None:
 
     # ── Columna izquierda: chat ───────────────────────────────────────────────
     with col_chat:
-        st.subheader("🤖 SOC Agent")
+        st.markdown("#### 🤖 SOC Agent — GPT-4o con contexto live de HANA")
 
         # Botón "Nueva conversación"
         btn_c, _ = st.columns([2, 5])
@@ -521,12 +589,17 @@ def render_chat_tab(conn) -> None:
         st.divider()
 
         # ── Historial de mensajes ─────────────────────────────────────────────
-        for msg in st.session_state["messages"]:
+        for msg_idx, msg in enumerate(st.session_state["messages"]):
             with st.chat_message(msg["role"]):
                 st.write(msg["content"])
                 # Si el mensaje del agente tiene una gráfica asociada, re-renderizarla
+                # key único por posición en historial — evita DuplicateElementId
                 if msg.get("chart_key") and msg.get("chart_figure"):
-                    st.plotly_chart(msg["chart_figure"], use_container_width=True)
+                    st.plotly_chart(
+                        msg["chart_figure"],
+                        use_container_width=True,
+                        key=f"history_chart_{msg_idx}_{msg['chart_key']}",
+                    )
 
         # ── Procesar pending_question (botones / ¿Qué hago?) ─────────────────
         # IMPORTANTE: limpiar ANTES de llamar _process_question para evitar loop.
