@@ -1,4 +1,4 @@
-﻿applications:
+applications:
 - name: sap-ai-soc-dashboard
   memory: 512M
   buildpacks:
