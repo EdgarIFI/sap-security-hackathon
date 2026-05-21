@@ -30,13 +30,13 @@ _BG             = "rgba(0,0,0,0)"       # fondo transparente para todos los char
 # ── Catálogo — importado por agent.py para el system prompt ───────────────────
 
 CHART_CATALOG: dict[str, str] = {
-    "brute_force_por_ip":    "IPs con mayor número de intentos de autenticación fallidos (24h)",
-    "brute_force_por_hora":  "Intentos de autenticación fallidos distribuidos por hora del día",
-    "alertas_por_tipo":      "Distribución de alertas por tipo y fuente de detección",
-    "alertas_por_hora":      "Mapa de calor de alertas por hora y día de la semana",
-    "path_scan_activity":    "Rutas del sistema más escaneadas por IPs sospechosas",
-    "llm_anomalias":         "Actividad LLM en el tiempo con marcas de anomalías detectadas",
-    "sistema_anomalias":     "Volumen de logs del sistema con error rate y marcas de anomalías",
+    "brute_force_por_ip":    "IPs with the most failed authentication attempts (last 24h)",
+    "brute_force_por_hora":  "Failed authentication attempts distributed by hour of day",
+    "alertas_por_tipo":      "Alert distribution by type and detection source",
+    "alertas_por_hora":      "Heatmap of alerts by hour and day of the week",
+    "path_scan_activity":    "Most scanned system paths by suspicious IPs",
+    "llm_anomalias":         "LLM activity over time with detected anomaly markers",
+    "sistema_anomalias":     "System log volume with error rate and anomaly markers",
 }
 
 
@@ -54,7 +54,7 @@ def build_chart(chart_key: str, data) -> go.Figure:
 
     Returns:
         go.Figure lista para st.plotly_chart().
-        Si el DataFrame está vacío retorna figura con anotación "Sin datos".
+        If DataFrame is empty returns figure with "No data" annotation.
 
     Raises:
         ValueError: si chart_key no existe en CHART_CATALOG.
@@ -103,7 +103,7 @@ def build_activity_chart(df: pd.DataFrame) -> go.Figure:
             Trace 4: círculos  · grises    para alerts_low    > 0
     """
     if df.empty:
-        return _empty_figure("Actividad del Sistema + Marcas de Alertas")
+        return _empty_figure("System Activity + Alert Markers")
 
     # Y para markers: ligeramente por encima del máximo del área
     y_marker = df["log_volume"].max() * 1.1 if df["log_volume"].max() > 0 else 1
@@ -171,9 +171,9 @@ def build_activity_chart(df: pd.DataFrame) -> go.Figure:
         ))
 
     fig.update_layout(**_base_layout(
-        title="Actividad del Sistema + Marcas de Alertas (últimas 48h)",
-        xaxis_title="Ventana UTC",
-        yaxis_title="Número de logs",
+        title="System Activity + Alert Markers (last 48h)",
+        xaxis_title="UTC Window",
+        yaxis_title="Log count",
     ))
 
     return fig
@@ -188,7 +188,7 @@ def _chart_brute_force_por_ip(df: pd.DataFrame) -> go.Figure:
     Muestra primera y última actividad en el tooltip.
     """
     if df.empty:
-        return _empty_figure("IPs con Intentos de Autenticación Fallidos (24h)")
+        return _empty_figure("IPs with Failed Authentication Attempts (24h)")
 
     df = df.sort_values("auth_failures", ascending=True)  # ascending para bar horizontal
 
@@ -208,9 +208,9 @@ def _chart_brute_force_por_ip(df: pd.DataFrame) -> go.Figure:
     for _, row in df.iterrows():
         txt = f"<b>{row['client_ip']}</b><br>Auth failures: {int(row['auth_failures'])}"
         if "primera_actividad" in df.columns and pd.notna(row.get("primera_actividad")):
-            txt += f"<br>Primera: {row['primera_actividad'].strftime('%H:%M UTC')}"
+            txt += f"<br>First seen: {row['primera_actividad'].strftime('%H:%M UTC')}"
         if "ultima_actividad" in df.columns and pd.notna(row.get("ultima_actividad")):
-            txt += f"<br>Última:  {row['ultima_actividad'].strftime('%H:%M UTC')}"
+            txt += f"<br>Last seen:  {row['ultima_actividad'].strftime('%H:%M UTC')}"
         hover_parts.append(txt + "<extra></extra>")
 
     fig = go.Figure(go.Bar(
@@ -224,8 +224,8 @@ def _chart_brute_force_por_ip(df: pd.DataFrame) -> go.Figure:
     ))
 
     fig.update_layout(**_base_layout(
-        title="IPs con Mayor Número de Auth Failures (últimas 24h)",
-        xaxis_title="Intentos fallidos",
+        title="IPs with Most Auth Failures (last 24h)",
+        xaxis_title="Failed attempts",
         yaxis_title="IP",
     ))
     fig.update_yaxes(tickfont=dict(family="monospace", size=11))
@@ -240,7 +240,7 @@ def _chart_brute_force_por_hora(df: pd.DataFrame) -> go.Figure:
     Marca la hora pico con un punto destacado.
     """
     if df.empty:
-        return _empty_figure("Intentos de Auth Fallidos por Hora del Día")
+        return _empty_figure("Failed Auth Attempts by Hour of Day")
 
     hora_pico = df.loc[df["auth_failures"].idxmax(), "hora"] if df["auth_failures"].max() > 0 else None
 
@@ -256,7 +256,7 @@ def _chart_brute_force_por_hora(df: pd.DataFrame) -> go.Figure:
         fillcolor="rgba(255,179,0,0.15)",
         marker=dict(size=6, color=_COLOR_MEDIUM),
         name="Auth failures",
-        hovertemplate="<b>%{x}:00h</b><br>Intentos: %{y}<extra></extra>",
+        hovertemplate="<b>%{x}:00h</b><br>Attempts: %{y}<extra></extra>",
     ))
 
     # Punto de hora pico
@@ -267,16 +267,16 @@ def _chart_brute_force_por_hora(df: pd.DataFrame) -> go.Figure:
             y=[pico_val],
             mode="markers+text",
             marker=dict(size=14, color=_COLOR_HIGH, symbol="star"),
-            text=[f"Pico: {hora_pico}:00h"],
+            text=[f"Peak: {hora_pico}:00h"],
             textposition="top center",
-            name="Hora pico",
-            hovertemplate=f"<b>Hora pico: {hora_pico}:00h</b><br>Intentos: {pico_val}<extra></extra>",
+            name="Peak hour",
+            hovertemplate=f"<b>Peak hour: {hora_pico}:00h</b><br>Attempts: {pico_val}<extra></extra>",
         ))
 
     fig.update_layout(**_base_layout(
-        title="Intentos de Autenticación Fallidos por Hora del Día (24h)",
-        xaxis_title="Hora UTC",
-        yaxis_title="Intentos fallidos",
+        title="Failed Auth Attempts by Hour of Day (24h)",
+        xaxis_title="UTC Hour",
+        yaxis_title="Failed attempts",
     ))
     fig.update_xaxes(tickmode="linear", tick0=0, dtick=2, range=[-0.5, 23.5])
 
@@ -290,7 +290,7 @@ def _chart_alertas_por_tipo(df: pd.DataFrame) -> go.Figure:
     Permite comparar visualmente qué detecta cada fuente.
     """
     if df.empty:
-        return _empty_figure("Distribución de Alertas por Tipo y Fuente (24h)")
+        return _empty_figure("Alert Distribution by Type and Source (24h)")
 
     fuentes = df["detection_source"].unique()
     color_map = {
@@ -307,14 +307,14 @@ def _chart_alertas_por_tipo(df: pd.DataFrame) -> go.Figure:
             y=df_f["count"],
             name=fuente,
             marker_color=color_map.get(fuente, _COLOR_LOW),
-            hovertemplate="<b>%{x}</b><br>Fuente: " + fuente + "<br>Count: %{y}<extra></extra>",
+            hovertemplate="<b>%{x}</b><br>Source: " + fuente + "<br>Count: %{y}<extra></extra>",
         ))
 
     fig.update_layout(
         **_base_layout(
-            title="Alertas por Tipo y Fuente de Detección (últimas 24h)",
-            xaxis_title="Tipo de alerta",
-            yaxis_title="Número de alertas",
+            title="Alerts by Type and Detection Source (last 24h)",
+            xaxis_title="Alert type",
+            yaxis_title="Number of alerts",
         ),
         barmode="group",
     )
@@ -330,7 +330,7 @@ def _chart_alertas_por_hora(df: pd.DataFrame) -> go.Figure:
     Pivota el DataFrame para construir la matriz del heatmap.
     """
     if df.empty:
-        return _empty_figure("Mapa de Calor de Alertas por Hora y Día (7 días)")
+        return _empty_figure("Alert Heatmap by Hour and Day (last 7 days)")
 
     # Pivot: filas = días, columnas = horas
     df["dia_str"] = df["dia"].astype(str)
@@ -355,14 +355,14 @@ def _chart_alertas_por_hora(df: pd.DataFrame) -> go.Figure:
             [0.4,  "#FFB300"],   # moderado: amarillo
             [1.0,  "#FF4444"],   # muchas: rojo
         ],
-        hovertemplate="<b>%{y} — %{x}:00h</b><br>Alertas: %{z}<extra></extra>",
-        colorbar=dict(title="Alertas"),
+        hovertemplate="<b>%{y} — %{x}:00h</b><br>Alerts: %{z}<extra></extra>",
+        colorbar=dict(title="Alerts"),
         zmin=0,
     ))
 
     fig.update_layout(**_base_layout(
-        title="Mapa de Calor — Alertas por Hora y Día (últimos 7 días)",
-        xaxis_title="Hora UTC",
+        title="Heatmap — Alerts by Hour and Day (last 7 days)",
+        xaxis_title="UTC Hour",
         yaxis_title="Día",
     ))
     fig.update_xaxes(tickmode="linear", tick0=0, dtick=2)
@@ -377,7 +377,7 @@ def _chart_path_scan_activity(df: pd.DataFrame) -> go.Figure:
     Trunca rutas largas para legibilidad.
     """
     if df.empty:
-        return _empty_figure("Rutas del Sistema Más Escaneadas (24h)")
+        return _empty_figure("Most Scanned System Paths (24h)")
 
     df = df.sort_values("count", ascending=True)
 
@@ -397,13 +397,13 @@ def _chart_path_scan_activity(df: pd.DataFrame) -> go.Figure:
         hovertemplate=(
             "<b>%{customdata[1]}</b><br>"
             "Requests: %{x}<br>"
-            "IPs distintas: %{customdata[0]}<extra></extra>"
+            "Distinct IPs: %{customdata[0]}<extra></extra>"
         ),
     ))
 
     fig.update_layout(**_base_layout(
-        title="Rutas Más Escaneadas — HTTP 404 (últimas 24h)",
-        xaxis_title="Número de requests",
+        title="Most Scanned Paths — HTTP 404 (last 24h)",
+        xaxis_title="Number of requests",
         yaxis_title="",
     ))
     fig.update_yaxes(tickfont=dict(family="monospace", size=10))
@@ -429,7 +429,7 @@ def _chart_llm_anomalias(
         df_alertas:   columnas detected_at, severity, details
     """
     if df_actividad.empty and df_alertas.empty:
-        return _empty_figure("Actividad LLM + Anomalías Detectadas (48h)")
+        return _empty_figure("LLM Activity + Detected Anomalies (48h)")
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
@@ -461,7 +461,7 @@ def _chart_llm_anomalias(
                 marker_color="rgba(0,102,204,0.2)",
                 hovertemplate=(
                     "<b>%{x|%H:%M}</b><br>"
-                    "Llamadas LLM: %{y}<extra></extra>"
+                    "LLM calls: %{y}<extra></extra>"
                 ),
             ),
             secondary_y=True,
@@ -486,10 +486,10 @@ def _chart_llm_anomalias(
                 name="ml_llm_anomaly",
                 customdata=df_alertas[["severity", "details"]].values,
                 hovertemplate=(
-                    "<b>🚨 Anomalía LLM detectada</b><br>"
-                    "Hora: %{x|%H:%M UTC}<br>"
-                    "Severidad: %{customdata[0]}<br>"
-                    "Detalle: %{customdata[1]}<extra></extra>"
+                    "<b>🚨 LLM Anomaly Detected</b><br>"
+                    "Time: %{x|%H:%M UTC}<br>"
+                    "Severity: %{customdata[0]}<br>"
+                    "Detail: %{customdata[1]}<extra></extra>"
                 ),
             ),
             secondary_y=False,
@@ -505,8 +505,8 @@ def _chart_llm_anomalias(
         ), secondary_y=False)
 
     layout = _base_layout(
-        title="Actividad LLM + Anomalías Detectadas (últimas 48h)",
-        xaxis_title="Ventana UTC",
+        title="LLM Activity + Detected Anomalies (last 48h)",
+        xaxis_title="UTC Window",
         yaxis_title="Avg cost (USD)",
     )
     fig.update_layout(**layout)
@@ -535,7 +535,7 @@ def _chart_sistema_anomalias(
         df_alertas:   columnas detected_at, severity, details
     """
     if df_actividad.empty and df_alertas.empty:
-        return _empty_figure("Actividad del Sistema + Anomalías ML Detectadas (48h)")
+        return _empty_figure("System Activity + ML Detected Anomalies (48h)")
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
@@ -593,10 +593,10 @@ def _chart_sistema_anomalias(
                 name="ml_sistema_anomaly",
                 customdata=df_alertas[["severity", "details"]].values,
                 hovertemplate=(
-                    "<b>🚨 Anomalía Sistema detectada</b><br>"
-                    "Hora: %{x|%H:%M UTC}<br>"
-                    "Severidad: %{customdata[0]}<br>"
-                    "Detalle: %{customdata[1]}<extra></extra>"
+                    "<b>🚨 System Anomaly Detected</b><br>"
+                    "Time: %{x|%H:%M UTC}<br>"
+                    "Severity: %{customdata[0]}<br>"
+                    "Detail: %{customdata[1]}<extra></extra>"
                 ),
             ),
             secondary_y=False,
@@ -611,9 +611,9 @@ def _chart_sistema_anomalias(
         ), secondary_y=False)
 
     layout = _base_layout(
-        title="Actividad del Sistema + Anomalías ML Detectadas (últimas 48h)",
-        xaxis_title="Ventana UTC",
-        yaxis_title="Número de logs",
+        title="System Activity + ML Anomalies Detected (last 48h)",
+        xaxis_title="UTC Window",
+        yaxis_title="Log count",
     )
     fig.update_layout(**layout)
     fig.update_yaxes(
@@ -636,7 +636,7 @@ def _empty_figure(title: str) -> go.Figure:
     fig.update_layout(
         **_base_layout(title),
         annotations=[dict(
-            text="Sin datos disponibles en el rango seleccionado",
+            text="No data available for the selected range",
             xref="paper", yref="paper",
             x=0.5, y=0.5,
             showarrow=False,
